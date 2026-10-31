@@ -124,6 +124,7 @@ function renderChat(data, own = false) {
 function sendChat(kind, content) {
   const message = {type:'chat', kind, content, name:userName};
   if (!validChat(message)) return false;
+  if (!peer || $('meeting').hidden) { notice('Entre em uma chamada antes de enviar mensagens.'); return false; }
   if (!isHost && !hostConnection?.open) { notice('Não foi possível enviar: conexão com a sala indisponível.'); return false; }
   if (isHost) broadcast(message); else hostConnection.send(message);
   renderChat(message, true); return true;
@@ -252,16 +253,36 @@ $('screen').onclick = async () => {
 $('copy').onclick = async () => { try { const url = new URL('sala.html', location.href); url.searchParams.set('sala', roomCode); await navigator.clipboard.writeText(url.href); $('copy').textContent = 'Copiado!'; setTimeout(() => $('copy').textContent = 'Copiar convite', 2000); } catch { notice('Não foi possível copiar. Compartilhe o código: ' + roomCode); } };
 const chatToggle = document.createElement('button'); chatToggle.id = 'chat-toggle'; chatToggle.textContent = '💬 Chat'; chatToggle.setAttribute('aria-expanded', 'false'); $('meeting').querySelector('.controls').append(chatToggle);
 const chatPanel = document.createElement('aside'); chatPanel.id = 'chat-panel'; chatPanel.hidden = true; chatPanel.setAttribute('aria-label', 'Chat da chamada');
-chatPanel.innerHTML = '<div class="chat-header"><div><strong>Chat da chamada</strong><small>Mensagens disponíveis durante a sessão</small></div><button type="button" id="chat-close" aria-label="Fechar chat">✕</button></div><div id="chat-messages" class="chat-messages" aria-live="polite"></div><p class="chat-info">Imagens PNG, JPEG, WebP ou GIF de até 512 KB.</p><form id="chat-form" class="chat-form"><label class="chat-attach" title="Enviar imagem" aria-label="Escolher imagem">＋<input id="chat-file" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden></label><input id="chat-input" type="text" maxlength="1000" placeholder="Digite uma mensagem" aria-label="Mensagem"><button type="submit">Enviar</button></form>';
+chatPanel.innerHTML = '<div class="chat-header"><div><strong>Chat da chamada</strong><small>Mensagens disponíveis durante a sessão</small></div><button type="button" id="chat-close" aria-label="Fechar chat">✕</button></div><div id="chat-messages" class="chat-messages" aria-live="polite"></div><p class="chat-info">Cole com Ctrl+V ou envie uma imagem de até 512 KB.</p><form id="chat-form" class="chat-form"><label class="chat-attach" title="Enviar imagem" aria-label="Escolher imagem">＋<input id="chat-file" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden></label><input id="chat-input" type="text" maxlength="1000" placeholder="Digite uma mensagem ou cole uma imagem" aria-label="Mensagem"><button type="submit">Enviar</button></form>';
 $('meeting').append(chatPanel);
 function toggleChat(open) { chatPanel.hidden = !open; chatToggle.setAttribute('aria-expanded', String(open)); if (open) { chatToggle.textContent = '💬 Chat'; $('chat-input').focus(); } }
 chatToggle.onclick = () => toggleChat(chatPanel.hidden); $('chat-close').onclick = () => toggleChat(false);
 $('chat-form').onsubmit = event => { event.preventDefault(); const input = $('chat-input'), text = input.value.trim(); if (text && sendChat('text', text)) input.value = ''; };
-$('chat-file').onchange = event => {
-  const file = event.target.files[0]; event.target.value = ''; if (!file) return;
-  if (!['image/jpeg','image/png','image/webp','image/gif'].includes(file.type) || file.size > 512 * 1024) { notice('Escolha uma imagem PNG, JPEG, WebP ou GIF de até 512 KB.'); return; }
+async function sendChatImage(file) {
+  if (!file) return;
+  if (!['image/jpeg','image/png','image/webp','image/gif'].includes(file.type)) { notice('Escolha uma imagem PNG, JPEG, WebP ou GIF.'); return; }
+  if (file.size > 512 * 1024 && file.type !== 'image/gif') {
+    let bitmap;
+    try {
+      bitmap = await createImageBitmap(file);
+      const canvas = document.createElement('canvas'), scale = Math.min(1, 1600 / Math.max(bitmap.width, bitmap.height));
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale)); canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+      const ctx = canvas.getContext('2d'); ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height); ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      for (const quality of [0.8, 0.6, 0.4, 0.25]) { const compressed = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', quality)); if (compressed && compressed.size <= 512 * 1024) { file = compressed; break; } }
+    } catch { notice('Não foi possível reduzir a imagem. Tente uma imagem menor.'); return; }
+    finally { bitmap?.close(); }
+  }
+  if (file.size > 512 * 1024) { notice('A imagem é muito grande. Tente uma imagem de até 512 KB.'); return; }
   const reader = new FileReader(); reader.onload = () => { if (!sendChat('image', reader.result)) notice('Não foi possível enviar a imagem.'); }; reader.onerror = () => notice('Não foi possível abrir a imagem.'); reader.readAsDataURL(file);
+}
+$('chat-file').onchange = event => {
+  const file = event.target.files[0]; event.target.value = ''; sendChatImage(file);
 };
+chatPanel.addEventListener('paste', event => {
+  const item = Array.from(event.clipboardData?.items || []).find(entry => entry.kind === 'file' && entry.type.startsWith('image/'));
+  if (!item) return;
+  event.preventDefault(); sendChatImage(item.getAsFile());
+});
 if (location.pathname.endsWith('/sala.html')) {
   const params = new URLSearchParams(location.search); $('room').value = params.get('sala') || '';
   $('welcome').classList.add('room-entry'); $('welcome').querySelector('.intro').hidden = true;
