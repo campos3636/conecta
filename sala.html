@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Conecta — chamadas em grupo</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header><div class="brand">✳ <span>conecta</span></div><span class="badge">PROTÓTIPO</span></header>
+    <section id="welcome" class="welcome">
+      <div class="intro"><span class="eyebrow">MAIS PERTO, ONDE VOCÊ ESTIVER</span><h1>Boas conversas<br><em>acontecem aqui.</em></h1><p>Reúna até 10 pessoas em uma sala e compartilhe sua tela com o grupo.</p><div class="features"><span>✦ Até 10 pessoas</span><span>◉ Compartilhamento de tela</span><span>⌁ Sem cadastro</span></div></div>
+      <div class="card"><h2>Comece uma chamada</h2><p>Crie uma sala ou entre com o código recebido.</p><label for="name">Seu nome</label><input id="name" maxlength="30" placeholder="Como podemos chamar você?" autocomplete="name"><button id="create" class="primary">Criar uma sala <span>→</span></button><div class="divider">ou entre em uma sala</div><label for="room">Código da sala</label><input id="room" maxlength="32" placeholder="Ex.: abc123" autocomplete="off"><button id="join" class="secondary">Entrar na sala</button><p class="hint">Permita o acesso ao microfone quando solicitado. Uma sessão por navegador.</p></div>
+    </section>
+    <section id="meeting" hidden><div class="meeting-head"><div><span class="eyebrow">SALA DE CHAMADA</span><h2>Sua reunião <span id="count" class="count">1 / 10</span></h2></div><div class="room-info">Código: <strong id="room-code"></strong> <button id="copy" class="small">Copiar convite</button></div></div><div id="notice" role="status"></div><div id="videos" class="videos"></div><div class="controls"><button id="mic">🎙 Microfone ligado</button><button id="camera">▣ Câmera ligada</button><button id="screen">▤ Compartilhar tela</button><button id="leave" class="danger">Sair da chamada</button></div><p class="meeting-hint">Compartilhamento em alta resolução depende do navegador, da conexão e da capacidade dos participantes.</p></section>
+    <footer>Feito para aproximar pessoas. <span>Chamadas diretamente no navegador.</span></footer>
+  </main>
+</body>
+</html>
