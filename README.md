@@ -8,7 +8,7 @@ Na pasta do projeto, execute `node server.js` e acesse `http://localhost:8000` e
 
 É possível entrar sem câmera física; o microfone continua necessário. Nesse caso, a chamada exibe uma imagem de substituição até que a tela seja compartilhada.
 
-O chat da chamada permite texto e imagens JPEG, PNG, WebP ou GIF de até 512 KB. As mensagens são mantidas somente durante a sessão e não são entregues a quem entra depois; não há garantia de entrega ou histórico persistente.
+O chat da chamada permite texto e imagens JPEG, PNG, WebP ou GIF de até 512 KB, enviadas pelo botão de anexar ou coladas com Ctrl+V no painel do chat. As mensagens são mantidas somente durante a sessão e não são entregues a quem entra depois; não há garantia de entrega ou histórico persistente.
 
 ## Limitações
 
