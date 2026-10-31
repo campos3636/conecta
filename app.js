@@ -2,21 +2,44 @@ const $ = id => document.getElementById(id);
 const MAX = 10;
 let peer, localStream, displayStream, hostConnection, isHost = false, roomCode = '', userName = '', hasCamera = true;
 let starting = false, releaseSession = null;
+let audioContext;
+const audioNodes = new Map();
 const browserId = localStorage.getItem('conecta-browser-id') || crypto.randomUUID();
 localStorage.setItem('conecta-browser-id', browserId);
 const connections = new Map(), calls = new Map(), members = new Map();
 const memberIds = new Map();
 
 function notice(message) { $('notice').textContent = message; }
+function clearAudio(id) { const node = audioNodes.get(id); if (node) { node.source.disconnect(); node.gain.disconnect(); audioNodes.delete(id); } }
 function videoTile(id, name, stream, local = false) {
   let tile = document.getElementById('video-' + id);
   if (!tile) {
     tile = document.createElement('div'); tile.id = 'video-' + id; tile.className = 'tile';
-    const video = document.createElement('video'); video.autoplay = true; video.playsInline = true; video.muted = local;
-    const label = document.createElement('span'); tile.append(video, label); $('videos').append(tile);
+    const video = document.createElement('video'); video.autoplay = true; video.playsInline = true; video.muted = true;
+    const label = document.createElement('span');
+    const fullscreen = document.createElement('button'); fullscreen.className = 'fullscreen'; fullscreen.textContent = '⛶ Tela cheia';
+    fullscreen.onclick = () => video.requestFullscreen?.().catch(() => notice('Não foi possível abrir a tela cheia.'));
+    tile.append(video, label, fullscreen);
+    if (!local) {
+      const controls = document.createElement('div'); controls.className = 'volume-control';
+      const volume = document.createElement('input'); volume.type = 'range'; volume.min = '0'; volume.max = '200'; volume.value = '100'; volume.setAttribute('aria-label', 'Volume de ' + name);
+      const value = document.createElement('output'); value.textContent = '100%';
+      volume.oninput = () => { value.textContent = volume.value + '%'; const node = audioNodes.get(id); if (node) node.gain.gain.value = Number(volume.value) / 100; audioContext?.resume(); };
+      controls.append(volume, value); tile.append(controls);
+    }
+    $('videos').append(tile);
   }
   tile.querySelector('span').textContent = name + (local ? ' (você)' : '');
   tile.querySelector('video').srcObject = stream;
+  if (!local && stream.getAudioTracks().length) {
+    clearAudio(id);
+    try {
+      audioContext ||= new AudioContext();
+      const source = audioContext.createMediaStreamSource(stream), gain = audioContext.createGain();
+      gain.gain.value = Number(tile.querySelector('input').value) / 100; source.connect(gain).connect(audioContext.destination);
+      audioNodes.set(id, {source, gain}); audioContext.resume();
+    } catch { tile.querySelector('video').muted = false; notice('Controle de volume ampliado indisponível neste navegador.'); }
+  }
 }
 function updateCount() { $('count').textContent = `${members.size} / ${MAX}`; }
 function outgoingStream() {
@@ -26,13 +49,13 @@ function setupCall(call) {
   if (calls.has(call.peer)) { call.close(); return; }
   calls.set(call.peer, call);
   call.on('stream', stream => videoTile(call.peer, members.get(call.peer) || 'Participante', stream));
-  call.on('close', () => { if (calls.get(call.peer) === call) calls.delete(call.peer); document.getElementById('video-' + call.peer)?.remove(); });
+  call.on('close', () => { if (calls.get(call.peer) === call) calls.delete(call.peer); clearAudio(call.peer); document.getElementById('video-' + call.peer)?.remove(); });
   call.on('error', () => notice('Não foi possível conectar a mídia de um participante.'));
 }
 function broadcast(message) { for (const conn of connections.values()) if (conn.open) conn.send(message); }
 function removeMember(id) {
   members.delete(id); memberIds.delete(id); connections.delete(id); calls.get(id)?.close(); calls.delete(id);
-  document.getElementById('video-' + id)?.remove(); updateCount();
+  clearAudio(id); document.getElementById('video-' + id)?.remove(); updateCount();
 }
 function handleHostConnection(conn) {
   let admitted = false;
@@ -67,7 +90,7 @@ function setupClient(conn) {
 function showMeeting() { $('welcome').hidden = true; $('meeting').hidden = false; $('room-code').textContent = roomCode; videoTile(peer.id, userName, localStream, true); }
 async function start(host) {
   if (starting || peer) return;
-  userName = $('name').value.trim(); roomCode = host ? Math.random().toString(36).slice(2,10) : $('room').value.trim().toLowerCase();
+  userName = $('name').value.trim(); roomCode = $('room').value.trim().toLowerCase();
   if (!userName || !roomCode || !/^[a-z0-9]{1,32}$/.test(roomCode)) { alert('Informe seu nome e um código de sala válido (letras e números).'); return; }
   if (!window.Peer) { alert('Não foi possível carregar o serviço de conexão. Verifique sua internet.'); return; }
   if (!navigator.locks) { alert('Seu navegador não oferece o recurso necessário para impedir sessões duplicadas. Use uma versão recente do Edge ou Chrome.'); return; }
@@ -80,18 +103,12 @@ async function start(host) {
       }).catch(reject);
     });
     if (!acquired) { alert('Você já possui uma chamada aberta em outra aba deste navegador.'); return; }
-    try {
-      localStream = await navigator.mediaDevices.getUserMedia({video:true, audio:true});
-      hasCamera = true;
-    } catch (err) {
-      if (err.name !== 'NotFoundError' && err.name !== 'OverconstrainedError') throw err;
-      localStream = await navigator.mediaDevices.getUserMedia({audio:true});
-      const canvas = document.createElement('canvas'); canvas.width = 640; canvas.height = 400;
-      const ctx = canvas.getContext('2d'); ctx.fillStyle = '#1c302b'; ctx.fillRect(0, 0, 640, 400);
-      ctx.fillStyle = '#ffffff'; ctx.font = '24px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('Câmera indisponível', 320, 200);
-      localStream.addTrack(canvas.captureStream(1).getVideoTracks()[0]); hasCamera = false;
-    }
-    $('camera').disabled = !hasCamera; $('camera').textContent = hasCamera ? '▣ Câmera ligada' : '▣ Sem câmera';
+    localStream = await navigator.mediaDevices.getUserMedia({audio:true});
+    const canvas = document.createElement('canvas'); canvas.width = 640; canvas.height = 400;
+    const ctx = canvas.getContext('2d'); ctx.fillStyle = '#1c302b'; ctx.fillRect(0, 0, 640, 400);
+    ctx.fillStyle = '#ffffff'; ctx.font = '24px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('Câmera desligada', 320, 200);
+    localStream.addTrack(canvas.captureStream(1).getVideoTracks()[0]); hasCamera = false;
+    $('camera').disabled = false; $('camera').textContent = '▣ Ligar câmera';
     isHost = host; peer = new Peer(host ? 'conecta-room-' + roomCode : undefined);
     peer.on('open', id => { members.set(id, userName); memberIds.set(id, browserId); if (host) { updateCount(); showMeeting(); } else setupClient(peer.connect('conecta-room-' + roomCode, {reliable:true})); });
     peer.on('connection', conn => { if (isHost) handleHostConnection(conn); else conn.close(); });
@@ -117,20 +134,35 @@ function leave() {
   const oldPeer = peer; peer = null; hostConnection = null; if (oldPeer) oldPeer.destroy();
   localStream?.getTracks().forEach(t => t.stop()); displayStream?.getTracks().forEach(t => t.stop());
   localStream = displayStream = null; calls.clear(); connections.clear(); members.clear(); memberIds.clear(); $('videos').replaceChildren();
+  for (const id of audioNodes.keys()) clearAudio(id);
   if (releaseSession) { releaseSession(); releaseSession = null; }
   $('welcome').hidden = false; $('meeting').hidden = true; notice(''); $('screen').textContent = '▤ Compartilhar tela'; $('screen').classList.remove('active'); $('mic').textContent = '🎙 Microfone ligado'; $('camera').textContent = '▣ Câmera ligada'; $('camera').disabled = false;
 }
-$('create').onclick = () => start(true); $('join').onclick = () => start(false); $('leave').onclick = leave;
+$('create').onclick = () => { const url = new URL('sala.html', location.href); url.searchParams.set('sala', crypto.randomUUID().replaceAll('-', '').slice(0, 16)); url.searchParams.set('criar', '1'); location.href = url.href; };
+$('join').onclick = () => { if (!location.pathname.endsWith('/sala.html')) { const code = $('room').value.trim().toLowerCase(); if (!/^[a-z0-9]{1,32}$/.test(code)) { alert('Informe um código de sala válido.'); return; } const url = new URL('sala.html', location.href); url.searchParams.set('sala', code); location.href = url.href; } else start(new URLSearchParams(location.search).has('criar')); }; $('leave').onclick = leave;
 $('mic').onclick = () => { const t = localStream.getAudioTracks()[0]; t.enabled = !t.enabled; $('mic').textContent = t.enabled ? '🎙 Microfone ligado' : '🎙 Microfone desligado'; };
-$('camera').onclick = () => { const t = localStream.getVideoTracks()[0]; t.enabled = !t.enabled; $('camera').textContent = t.enabled ? '▣ Câmera ligada' : '▣ Câmera desligada'; };
+$('camera').onclick = async () => {
+  const t = localStream.getVideoTracks()[0];
+  if (hasCamera) { t.enabled = !t.enabled; $('camera').textContent = t.enabled ? '▣ Câmera ligada' : '▣ Câmera desligada'; return; }
+  try { const stream = await navigator.mediaDevices.getUserMedia({video:true}); const track = stream.getVideoTracks()[0]; localStream.removeTrack(t); t.stop(); localStream.addTrack(track); hasCamera = true; if (!displayStream) { await replaceVideo(track); videoTile(peer.id, userName, localStream, true); } $('camera').textContent = '▣ Câmera ligada'; }
+  catch { notice('Não foi possível ligar a câmera. Confira se ela está conectada e autorizada.'); }
+};
 $('screen').onclick = async () => {
   if (displayStream) { await stopScreen(); return; }
   try {
-    displayStream = await navigator.mediaDevices.getDisplayMedia({video:{width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30}},audio:false});
+    displayStream = await navigator.mediaDevices.getDisplayMedia({video:{width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:60}},audio:false});
     displayStream.getVideoTracks()[0].onended = stopScreen;
     await replaceVideo(displayStream.getVideoTracks()[0]); videoTile(peer.id, userName, displayStream, true);
     $('screen').textContent = '▤ Parar compartilhamento'; $('screen').classList.add('active');
   } catch (err) { if (displayStream) await stopScreen(); if (err.name !== 'NotAllowedError') notice('Não foi possível compartilhar a tela.'); }
 };
-$('copy').onclick = async () => { try { const url = new URL(location.href); url.searchParams.set('sala', roomCode); await navigator.clipboard.writeText(url.href); $('copy').textContent = 'Copiado!'; setTimeout(() => $('copy').textContent = 'Copiar convite', 2000); } catch { notice('Não foi possível copiar. Compartilhe o código: ' + roomCode); } };
-$('room').value = new URLSearchParams(location.search).get('sala') || '';
+$('copy').onclick = async () => { try { const url = new URL('sala.html', location.href); url.searchParams.set('sala', roomCode); await navigator.clipboard.writeText(url.href); $('copy').textContent = 'Copiado!'; setTimeout(() => $('copy').textContent = 'Copiar convite', 2000); } catch { notice('Não foi possível copiar. Compartilhe o código: ' + roomCode); } };
+if (location.pathname.endsWith('/sala.html')) {
+  const params = new URLSearchParams(location.search); $('room').value = params.get('sala') || '';
+  $('welcome').classList.add('room-entry'); $('welcome').querySelector('.intro').hidden = true;
+  $('welcome').querySelector('h2').textContent = params.has('criar') ? 'Criar sua sala' : 'Entrar na chamada';
+  $('welcome').querySelector('.card > p').textContent = 'Informe seu ID (nome) para participar.';
+  $('welcome').querySelector('label[for="name"]').textContent = 'Seu ID / nome';
+  $('create').hidden = true; $('welcome').querySelector('.divider').hidden = true; $('welcome').querySelector('label[for="room"]').hidden = true; $('room').hidden = true;
+  $('join').textContent = params.has('criar') ? 'Criar e entrar' : 'Entrar na chamada';
+}
