@@ -4,19 +4,38 @@ let peer, localStream, displayStream, hostConnection, isHost = false, roomCode =
 let starting = false, releaseSession = null;
 let audioContext;
 const audioNodes = new Map();
+const voiceMonitors = new Map();
 const browserId = localStorage.getItem('conecta-browser-id') || crypto.randomUUID();
 localStorage.setItem('conecta-browser-id', browserId);
 const connections = new Map(), calls = new Map(), members = new Map();
 const memberIds = new Map();
 const screenAudioCalls = new Map(), incomingScreenAudio = new Map();
 
-function notice(message) { $('notice').textContent = message; }
+function notice(message) {
+  const box = $('notice'); box.replaceChildren();
+  if (!message) return;
+  const text = document.createElement('span'); text.textContent = message;
+  const close = document.createElement('button'); close.textContent = '✕'; close.className = 'notice-close'; close.setAttribute('aria-label', 'Fechar aviso'); close.onclick = () => box.replaceChildren();
+  box.append(text, close);
+}
 function highlightTile(tile) {
   const selected = tile.classList.contains('featured');
   document.querySelectorAll('#videos .featured').forEach(item => { item.classList.remove('featured'); const button = item.querySelector('.feature-button'); if (button) { button.textContent = '☆ Destacar'; button.setAttribute('aria-pressed', 'false'); } });
   if (!selected) { tile.classList.add('featured'); const button = tile.querySelector('.feature-button'); button.textContent = '★ Em destaque'; button.setAttribute('aria-pressed', 'true'); }
 }
 function clearAudio(id) { const node = audioNodes.get(id); if (node) { node.source.disconnect(); node.gain.disconnect(); audioNodes.delete(id); } }
+function clearVoice(id) { const monitor = voiceMonitors.get(id); if (monitor) { clearInterval(monitor.timer); monitor.source.disconnect(); monitor.analyser.disconnect(); voiceMonitors.delete(id); } }
+function monitorVoice(id, stream, tile) {
+  clearVoice(id);
+  if (id.startsWith('screen-') || !stream.getAudioTracks().length) return;
+  try {
+    audioContext ||= new AudioContext(); audioContext.resume();
+    const source = audioContext.createMediaStreamSource(stream), analyser = audioContext.createAnalyser(); analyser.fftSize = 512; source.connect(analyser);
+    const samples = new Uint8Array(analyser.fftSize);
+    const timer = setInterval(() => { if (!tile.isConnected) { clearVoice(id); return; } analyser.getByteTimeDomainData(samples); let total = 0; for (const sample of samples) total += ((sample - 128) / 128) ** 2; tile.classList.toggle('speaking', Math.sqrt(total / samples.length) > 0.025); }, 200);
+    voiceMonitors.set(id, {source, analyser, timer});
+  } catch { /* A chamada continua funcionando mesmo sem indicador visual. */ }
+}
 function showScreenAudio(id, stream) {
   const key = 'screen-' + id;
   videoTile(key, 'Tela de ' + (members.get(id) || 'Participante'), stream);
@@ -63,6 +82,7 @@ function videoTile(id, name, stream, local = false) {
   }
   tile.querySelector('span').textContent = name + (local ? ' (você)' : '');
   tile.querySelector('video').srcObject = stream;
+  monitorVoice(id, stream, tile);
   if (!local && stream.getAudioTracks().length) {
     clearAudio(id);
     try {
@@ -82,7 +102,7 @@ function setupCall(call) {
   calls.set(call.peer, call);
   sendScreenAudio(call.peer);
   call.on('stream', stream => videoTile(call.peer, members.get(call.peer) || 'Participante', stream));
-  call.on('close', () => { if (calls.get(call.peer) === call) calls.delete(call.peer); clearAudio(call.peer); document.getElementById('video-' + call.peer)?.remove(); });
+  call.on('close', () => { if (calls.get(call.peer) === call) calls.delete(call.peer); clearAudio(call.peer); clearVoice(call.peer); document.getElementById('video-' + call.peer)?.remove(); });
   call.on('error', () => notice('Não foi possível conectar a mídia de um participante.'));
 }
 function broadcast(message) { for (const conn of connections.values()) if (conn.open) conn.send(message); }
@@ -90,7 +110,7 @@ function removeMember(id) {
   members.delete(id); memberIds.delete(id); connections.delete(id); calls.get(id)?.close(); calls.delete(id);
   screenAudioCalls.get(id)?.close(); screenAudioCalls.delete(id); incomingScreenAudio.get(id)?.close(); incomingScreenAudio.delete(id);
   clearAudio('screen-' + id); document.getElementById('video-screen-' + id)?.remove();
-  clearAudio(id); document.getElementById('video-' + id)?.remove(); updateCount();
+  clearAudio(id); clearVoice(id); document.getElementById('video-' + id)?.remove(); updateCount();
 }
 function handleHostConnection(conn) {
   let admitted = false;
@@ -138,7 +158,8 @@ async function start(host) {
       }).catch(reject);
     });
     if (!acquired) { alert('Você já possui uma chamada aberta em outra aba deste navegador.'); return; }
-    localStream = await navigator.mediaDevices.getUserMedia({audio:true});
+    const selectedMic = $('mic-select')?.value;
+    localStream = await navigator.mediaDevices.getUserMedia({audio:selectedMic ? {deviceId:{exact:selectedMic}} : true});
     const canvas = document.createElement('canvas'); canvas.width = 640; canvas.height = 400;
     const ctx = canvas.getContext('2d'); ctx.fillStyle = '#1c302b'; ctx.fillRect(0, 0, 640, 400);
     ctx.fillStyle = '#ffffff'; ctx.font = '24px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('Câmera desligada', 320, 200);
@@ -172,6 +193,7 @@ function leave() {
   for (const call of incomingScreenAudio.values()) call.close(); incomingScreenAudio.clear();
   localStream = displayStream = null; calls.clear(); connections.clear(); members.clear(); memberIds.clear(); $('videos').replaceChildren();
   for (const id of audioNodes.keys()) clearAudio(id);
+  for (const id of voiceMonitors.keys()) clearVoice(id);
   if (releaseSession) { releaseSession(); releaseSession = null; }
   $('welcome').hidden = false; $('meeting').hidden = true; notice(''); $('screen').textContent = '▤ Compartilhar tela'; $('screen').classList.remove('active'); $('mic').textContent = '🎙 Microfone ligado'; $('camera').textContent = '▣ Câmera ligada'; $('camera').disabled = false;
 }
@@ -205,6 +227,25 @@ if (location.pathname.endsWith('/sala.html')) {
   $('welcome').querySelector('label[for="name"]').textContent = 'Seu ID / nome';
   $('create').hidden = true; $('welcome').querySelector('.divider').hidden = true; $('welcome').querySelector('label[for="room"]').hidden = true; $('room').hidden = true;
   $('join').textContent = params.has('criar') ? 'Criar e entrar' : 'Entrar na chamada';
+  const prep = document.createElement('div'); prep.className = 'mic-prep';
+  const label = document.createElement('label'); label.htmlFor = 'mic-select'; label.textContent = 'Microfone';
+  const select = document.createElement('select'); select.id = 'mic-select';
+  const defaultOption = document.createElement('option'); defaultOption.value = ''; defaultOption.textContent = 'Microfone padrão'; select.append(defaultOption);
+  const test = document.createElement('button'); test.type = 'button'; test.className = 'mic-test'; test.textContent = 'Verificar microfone';
+  const status = document.createElement('p'); status.className = 'mic-status'; status.textContent = 'A câmera permanece desligada ao entrar.';
+  test.onclick = async () => {
+    test.disabled = true; let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({audio:select.value ? {deviceId:{exact:select.value}} : true});
+      const current = stream.getAudioTracks()[0].getSettings().deviceId;
+      const devices = await navigator.mediaDevices.enumerateDevices(); select.replaceChildren(defaultOption);
+      for (const device of devices.filter(d => d.kind === 'audioinput')) { const option = document.createElement('option'); option.value = device.deviceId; option.textContent = device.label || 'Microfone'; select.append(option); }
+      if (current && [...select.options].some(option => option.value === current)) select.value = current;
+      status.textContent = 'Microfone acessível. Fale na chamada para testá-lo com outra pessoa.';
+    } catch { status.textContent = 'Não foi possível acessar o microfone. Verifique a conexão e as permissões do navegador.'; }
+    finally { stream?.getTracks().forEach(track => track.stop()); test.disabled = false; }
+  };
+  prep.append(label, select, test, status); $('join').before(prep);
 }
 else {
   $('welcome').querySelector('label[for="name"]').hidden = true; $('name').hidden = true;
