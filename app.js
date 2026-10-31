@@ -156,7 +156,7 @@ async function stopScreen() {
   if (!displayStream) return;
   for (const call of screenAudioCalls.values()) call.close(); screenAudioCalls.clear();
   const old = displayStream; displayStream = null; old.getTracks().forEach(t => t.stop());
-  document.getElementById('video-screen-local')?.remove(); $('screen').textContent = '▤ Compartilhar tela'; $('screen').classList.remove('active');
+  document.getElementById('video-screen-local')?.remove(); $('screen').textContent = '▤ Compartilhar tela'; $('screen').classList.remove('active'); notice('');
 }
 function leave() {
   const oldPeer = peer; peer = null; hostConnection = null; if (oldPeer) oldPeer.destroy();
@@ -180,12 +180,12 @@ $('camera').onclick = async () => {
 $('screen').onclick = async () => {
   if (displayStream) { await stopScreen(); return; }
   try {
-    displayStream = await navigator.mediaDevices.getDisplayMedia({video:{width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:60}},audio:true});
+    displayStream = await navigator.mediaDevices.getDisplayMedia({video:{width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:60}},audio:true,systemAudio:'include',windowAudio:'system'});
     displayStream.getVideoTracks()[0].onended = stopScreen;
     videoTile('screen-local', 'Sua transmissão', displayStream, true); document.getElementById('video-screen-local').classList.add('screen-tile');
     for (const id of calls.keys()) sendScreenAudio(id);
     if (displayStream.getAudioTracks().length) { notice('Compartilhamento com áudio ativado.'); }
-    else notice('Tela compartilhada sem áudio. Para transmitir som, selecione a opção de compartilhar áudio na janela do navegador, quando disponível.');
+    else notice('Tela compartilhada sem áudio. Pare o compartilhamento e tente novamente: no Edge, escolha Tela inteira e marque Compartilhar áudio do sistema antes de clicar em Compartilhar. A opção pode não aparecer ao escolher uma janela.');
     $('screen').textContent = '▤ Parar compartilhamento'; $('screen').classList.add('active');
   } catch (err) { if (displayStream) await stopScreen(); if (err.name !== 'NotAllowedError') notice('Não foi possível compartilhar a tela.'); }
 };
