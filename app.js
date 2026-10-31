@@ -10,6 +10,9 @@ localStorage.setItem('conecta-browser-id', browserId);
 const connections = new Map(), calls = new Map(), members = new Map();
 const memberIds = new Map();
 const screenAudioCalls = new Map(), incomingScreenAudio = new Map();
+function microphoneConstraints(deviceId) {
+  return {echoCancellation:true, noiseSuppression:true, autoGainControl:true, ...(deviceId ? {deviceId:{exact:deviceId}} : {})};
+}
 
 function notice(message) {
   const box = $('notice'); box.replaceChildren();
@@ -32,7 +35,7 @@ function monitorVoice(id, stream, tile) {
     audioContext ||= new AudioContext(); audioContext.resume();
     const source = audioContext.createMediaStreamSource(stream), analyser = audioContext.createAnalyser(); analyser.fftSize = 512; source.connect(analyser);
     const samples = new Uint8Array(analyser.fftSize);
-    const timer = setInterval(() => { if (!tile.isConnected) { clearVoice(id); return; } analyser.getByteTimeDomainData(samples); let total = 0; for (const sample of samples) total += ((sample - 128) / 128) ** 2; tile.classList.toggle('speaking', Math.sqrt(total / samples.length) > 0.025); }, 200);
+    const timer = setInterval(() => { if (!tile.isConnected) { clearVoice(id); return; } analyser.getByteTimeDomainData(samples); let total = 0; for (const sample of samples) total += ((sample - 128) / 128) ** 2; tile.classList.toggle('speaking', Math.sqrt(total / samples.length) > 0.045); }, 200);
     voiceMonitors.set(id, {source, analyser, timer});
   } catch { /* A chamada continua funcionando mesmo sem indicador visual. */ }
 }
@@ -159,7 +162,7 @@ async function start(host) {
     });
     if (!acquired) { alert('Você já possui uma chamada aberta em outra aba deste navegador.'); return; }
     const selectedMic = $('mic-select')?.value;
-    localStream = await navigator.mediaDevices.getUserMedia({audio:selectedMic ? {deviceId:{exact:selectedMic}} : true});
+    localStream = await navigator.mediaDevices.getUserMedia({audio:microphoneConstraints(selectedMic)});
     const canvas = document.createElement('canvas'); canvas.width = 640; canvas.height = 400;
     const ctx = canvas.getContext('2d'); ctx.fillStyle = '#1c302b'; ctx.fillRect(0, 0, 640, 400);
     ctx.fillStyle = '#ffffff'; ctx.font = '24px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('Câmera desligada', 320, 200);
@@ -236,7 +239,7 @@ if (location.pathname.endsWith('/sala.html')) {
   test.onclick = async () => {
     test.disabled = true; let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({audio:select.value ? {deviceId:{exact:select.value}} : true});
+      stream = await navigator.mediaDevices.getUserMedia({audio:microphoneConstraints(select.value)});
       const current = stream.getAudioTracks()[0].getSettings().deviceId;
       const devices = await navigator.mediaDevices.enumerateDevices(); select.replaceChildren(defaultOption);
       for (const device of devices.filter(d => d.kind === 'audioinput')) { const option = document.createElement('option'); option.value = device.deviceId; option.textContent = device.label || 'Microfone'; select.append(option); }
