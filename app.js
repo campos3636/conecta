@@ -109,6 +109,25 @@ function setupCall(call) {
   call.on('error', () => notice('Não foi possível conectar a mídia de um participante.'));
 }
 function broadcast(message) { for (const conn of connections.values()) if (conn.open) conn.send(message); }
+function validChat(data) {
+  return data && ((data.kind === 'text' && typeof data.content === 'string' && data.content.trim().length > 0 && data.content.length <= 1000) || (data.kind === 'image' && typeof data.content === 'string' && data.content.length <= 700000 && /^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(data.content)));
+}
+function renderChat(data, own = false) {
+  if (!validChat(data)) return;
+  const list = $('chat-messages'), bubble = document.createElement('article'); bubble.className = 'chat-bubble' + (own ? ' own' : '');
+  const author = document.createElement('strong'); author.textContent = own ? 'Você' : String(data.name || 'Participante').slice(0, 30); bubble.append(author);
+  if (data.kind === 'text') { const text = document.createElement('p'); text.textContent = data.content; bubble.append(text); }
+  else { const image = document.createElement('img'); image.src = data.content; image.alt = 'Imagem enviada por ' + author.textContent; image.loading = 'lazy'; bubble.append(image); }
+  list.append(bubble); list.scrollTop = list.scrollHeight;
+  if (!own && $('chat-panel').hidden) { $('chat-toggle').textContent = '💬 Chat • nova mensagem'; }
+}
+function sendChat(kind, content) {
+  const message = {type:'chat', kind, content, name:userName};
+  if (!validChat(message)) return false;
+  if (!isHost && !hostConnection?.open) { notice('Não foi possível enviar: conexão com a sala indisponível.'); return false; }
+  if (isHost) broadcast(message); else hostConnection.send(message);
+  renderChat(message, true); return true;
+}
 function removeMember(id) {
   members.delete(id); memberIds.delete(id); connections.delete(id); calls.get(id)?.close(); calls.delete(id);
   screenAudioCalls.get(id)?.close(); screenAudioCalls.delete(id); incomingScreenAudio.get(id)?.close(); incomingScreenAudio.delete(id);
@@ -118,7 +137,14 @@ function removeMember(id) {
 function handleHostConnection(conn) {
   let admitted = false;
   conn.on('data', data => {
-    if (admitted || data?.type !== 'join') return;
+    if (admitted) {
+      if (data?.type === 'chat' && validChat(data)) {
+        const message = {type:'chat', kind:data.kind, content:data.content, name:members.get(conn.peer)};
+        renderChat(message); for (const other of connections.values()) if (other !== conn && other.open) other.send(message);
+      }
+      return;
+    }
+    if (data?.type !== 'join') return;
     if (typeof data.browserId !== 'string' || !data.browserId || Array.from(memberIds.values()).includes(data.browserId)) { conn.send({type:'duplicate'}); setTimeout(() => conn.close(), 500); return; }
     if (members.size >= MAX) { conn.send({type:'full'}); setTimeout(() => conn.close(), 500); return; }
     admitted = true; connections.set(conn.peer, conn); members.set(conn.peer, String(data.name || 'Participante').slice(0,30)); memberIds.set(conn.peer, data.browserId);
@@ -141,6 +167,7 @@ function setupClient(conn) {
     }
     if (data?.type === 'member') { members.set(data.id, data.name); updateCount(); }
     if (data?.type === 'left') removeMember(data.id);
+    if (data?.type === 'chat') renderChat(data);
   });
   conn.on('close', () => { if (peer && !peer.destroyed) { alert('A sala foi encerrada porque o anfitrião saiu ou perdeu a conexão.'); leave(); } });
   conn.on('error', () => { notice('Conexão com o anfitrião interrompida.'); });
@@ -197,6 +224,7 @@ function leave() {
   localStream = displayStream = null; calls.clear(); connections.clear(); members.clear(); memberIds.clear(); $('videos').replaceChildren();
   for (const id of audioNodes.keys()) clearAudio(id);
   for (const id of voiceMonitors.keys()) clearVoice(id);
+  $('chat-messages').replaceChildren(); $('chat-input').value = ''; $('chat-panel').hidden = true; $('chat-toggle').textContent = '💬 Chat';
   if (releaseSession) { releaseSession(); releaseSession = null; }
   $('welcome').hidden = false; $('meeting').hidden = true; notice(''); $('screen').textContent = '▤ Compartilhar tela'; $('screen').classList.remove('active'); $('mic').textContent = '🎙 Microfone ligado'; $('camera').textContent = '▣ Câmera ligada'; $('camera').disabled = false;
 }
@@ -222,6 +250,18 @@ $('screen').onclick = async () => {
   } catch (err) { if (displayStream) await stopScreen(); if (err.name !== 'NotAllowedError') notice('Não foi possível compartilhar a tela.'); }
 };
 $('copy').onclick = async () => { try { const url = new URL('sala.html', location.href); url.searchParams.set('sala', roomCode); await navigator.clipboard.writeText(url.href); $('copy').textContent = 'Copiado!'; setTimeout(() => $('copy').textContent = 'Copiar convite', 2000); } catch { notice('Não foi possível copiar. Compartilhe o código: ' + roomCode); } };
+const chatToggle = document.createElement('button'); chatToggle.id = 'chat-toggle'; chatToggle.textContent = '💬 Chat'; chatToggle.setAttribute('aria-expanded', 'false'); $('meeting').querySelector('.controls').append(chatToggle);
+const chatPanel = document.createElement('aside'); chatPanel.id = 'chat-panel'; chatPanel.hidden = true; chatPanel.setAttribute('aria-label', 'Chat da chamada');
+chatPanel.innerHTML = '<div class="chat-header"><div><strong>Chat da chamada</strong><small>Mensagens disponíveis durante a sessão</small></div><button type="button" id="chat-close" aria-label="Fechar chat">✕</button></div><div id="chat-messages" class="chat-messages" aria-live="polite"></div><p class="chat-info">Imagens PNG, JPEG, WebP ou GIF de até 512 KB.</p><form id="chat-form" class="chat-form"><label class="chat-attach" title="Enviar imagem" aria-label="Escolher imagem">＋<input id="chat-file" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden></label><input id="chat-input" type="text" maxlength="1000" placeholder="Digite uma mensagem" aria-label="Mensagem"><button type="submit">Enviar</button></form>';
+$('meeting').append(chatPanel);
+function toggleChat(open) { chatPanel.hidden = !open; chatToggle.setAttribute('aria-expanded', String(open)); if (open) { chatToggle.textContent = '💬 Chat'; $('chat-input').focus(); } }
+chatToggle.onclick = () => toggleChat(chatPanel.hidden); $('chat-close').onclick = () => toggleChat(false);
+$('chat-form').onsubmit = event => { event.preventDefault(); const input = $('chat-input'), text = input.value.trim(); if (text && sendChat('text', text)) input.value = ''; };
+$('chat-file').onchange = event => {
+  const file = event.target.files[0]; event.target.value = ''; if (!file) return;
+  if (!['image/jpeg','image/png','image/webp','image/gif'].includes(file.type) || file.size > 512 * 1024) { notice('Escolha uma imagem PNG, JPEG, WebP ou GIF de até 512 KB.'); return; }
+  const reader = new FileReader(); reader.onload = () => { if (!sendChat('image', reader.result)) notice('Não foi possível enviar a imagem.'); }; reader.onerror = () => notice('Não foi possível abrir a imagem.'); reader.readAsDataURL(file);
+};
 if (location.pathname.endsWith('/sala.html')) {
   const params = new URLSearchParams(location.search); $('room').value = params.get('sala') || '';
   $('welcome').classList.add('room-entry'); $('welcome').querySelector('.intro').hidden = true;
