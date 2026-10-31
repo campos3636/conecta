@@ -11,6 +11,11 @@ const memberIds = new Map();
 const screenAudioCalls = new Map(), incomingScreenAudio = new Map();
 
 function notice(message) { $('notice').textContent = message; }
+function highlightTile(tile) {
+  const selected = tile.classList.contains('featured');
+  document.querySelectorAll('#videos .featured').forEach(item => { item.classList.remove('featured'); const button = item.querySelector('.feature-button'); if (button) { button.textContent = '☆ Destacar'; button.setAttribute('aria-pressed', 'false'); } });
+  if (!selected) { tile.classList.add('featured'); const button = tile.querySelector('.feature-button'); button.textContent = '★ Em destaque'; button.setAttribute('aria-pressed', 'true'); }
+}
 function clearAudio(id) { const node = audioNodes.get(id); if (node) { node.source.disconnect(); node.gain.disconnect(); audioNodes.delete(id); } }
 function showScreenAudio(id, stream) {
   const key = 'screen-' + id;
@@ -39,12 +44,14 @@ function videoTile(id, name, stream, local = false) {
     const video = document.createElement('video'); video.autoplay = true; video.playsInline = true; video.muted = true;
     const label = document.createElement('span');
     const fullscreen = document.createElement('button'); fullscreen.className = 'fullscreen'; fullscreen.textContent = '⛶ Tela cheia';
+    const feature = document.createElement('button'); feature.className = 'feature-button'; feature.textContent = '☆ Destacar'; feature.setAttribute('aria-pressed', 'false'); feature.onclick = () => highlightTile(tile);
+    video.onclick = () => highlightTile(tile);
     fullscreen.onclick = async () => {
       if (tile.classList.contains('expanded')) { tile.classList.remove('expanded'); fullscreen.textContent = '⛶ Tela cheia'; return; }
       try { if (video.webkitEnterFullscreen && !video.requestFullscreen) { video.webkitEnterFullscreen(); return; } if (video.requestFullscreen) { await video.requestFullscreen(); return; } } catch {}
       tile.classList.add('expanded'); fullscreen.textContent = '✕ Fechar';
     };
-    tile.append(video, label, fullscreen);
+    tile.append(video, label, fullscreen, feature);
     if (!local) {
       const controls = document.createElement('div'); controls.className = 'volume-control';
       const volume = document.createElement('input'); volume.type = 'range'; volume.min = '0'; volume.max = '200'; volume.value = '100'; volume.setAttribute('aria-label', 'Volume de ' + name);
