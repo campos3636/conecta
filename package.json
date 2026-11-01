@@ -1,0 +1,14 @@
+{
+  "name": "campos-calls",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test --test-concurrency=1 tests/*.test.cjs"
+  },
+  "devDependencies": {
+    "peer": "1.0.2",
+    "peerjs": "1.5.4",
+    "playwright": "1.64.1"
+  }
+}

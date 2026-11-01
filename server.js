@@ -10,4 +10,4 @@ http.createServer((req, res) => {
     if (err) { res.writeHead(500); res.end('Server error'); return; }
     res.writeHead(200, { 'Content-Type': file[1] }); res.end(data);
   });
-}).listen(8000, '127.0.0.1', () => console.log('Conecta: http://localhost:8000'));
+}).listen(Number(process.env.PORT || 8000), '127.0.0.1', function () { console.log('Campos Calls: http://localhost:' + this.address().port); });
