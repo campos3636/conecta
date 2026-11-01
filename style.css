@@ -48,3 +48,9 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 .videos:has(.featured) .tile:not(.featured) .fullscreen{font-size:0}
 .videos:has(.featured) .tile:not(.featured) .fullscreen::before{content:'⛶';font-size:14px}
 @media(max-width:600px){#notice:not(:empty){flex-wrap:wrap}.avatar-name{font-size:12px}.avatar-state{display:none}.tile-footer .volume-control input{width:55px}.avatar-placeholder{padding-bottom:65px}}
+.tile-toolbar .screen-retry{position:static;pointer-events:auto;background:#12231ddd;color:#e7f8ed;padding:5px 9px;font-size:16px;line-height:1.2}
+#screen-diagnostics{margin-top:14px;padding:12px 14px;border:1px solid #344c3e;border-radius:10px;background:#152019eb;color:#c6ddcf;font-size:13px}
+#screen-diagnostics summary{cursor:pointer;font-weight:700}
+#screen-diagnostics p{margin:10px 0;overflow-wrap:anywhere}
+#screen-diagnostics button{padding:8px 12px;background:#293b31;color:#c6eed6;font-size:12px}
+#screen-diagnostics small{display:block;color:#97aea0;font-size:11px;margin-top:8px}

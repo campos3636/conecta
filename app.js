@@ -11,6 +11,9 @@ localStorage.setItem('conecta-browser-id', browserId);
 const connections = new Map(), calls = new Map(), members = new Map();
 const memberIds = new Map();
 const screenAudioCalls = new Map(), incomingScreenAudio = new Map();
+const screenSendHealth = new Map(), screenReceiveHealth = new Map();
+let screenSession = null;
+const SCREEN_CONNECT_TIMEOUT = 12000, SCREEN_MAX_RETRIES = 2;
 const profiles = new Map();
 const AVATARS = [
   {id:'gamepad', icon:'🎮', name:'Controle'}, {id:'headset', icon:'🎧', name:'Fone'},
@@ -97,13 +100,154 @@ function showScreenAudio(id, stream) {
   const key = 'screen-' + id;
   videoTile(key, 'Tela de ' + (members.get(id) || 'Participante'), stream);
 }
-function sendScreenAudio(id) {
+// Prefer a broadly supported codec on recovery without removing other codecs.
+function preferScreenVP8(sdp) {
+  const lines = sdp.split('\r\n');
+  for (let start = 0; start < lines.length; start++) {
+    if (!lines[start].startsWith('m=video ')) continue;
+    let end = start + 1; while (end < lines.length && !lines[end].startsWith('m=')) end++;
+    const section = lines.slice(start, end), header = lines[start].split(' '), offered = header.slice(3);
+    const vp8 = section.map(line => /^a=rtpmap:(\d+) VP8\/90000/i.exec(line)?.[1]).filter(id => offered.includes(id));
+    const rtx = section.map(line => /^a=fmtp:(\d+) .*\bapt=(\d+)(?:;|$)/.exec(line)).filter(match => match && vp8.includes(match[2]) && offered.includes(match[1])).map(match => match[1]);
+    const preferred = [...vp8, ...rtx];
+    if (vp8.length) lines[start] = [...header.slice(0,3), ...preferred, ...offered.filter(id => !preferred.includes(id))].join(' ');
+    start = end - 1;
+  }
+  return lines.join('\r\n');
+}
+function screenPacketValid(data) {
+  return ['ready','retry','stop'].includes(data?.action) && typeof data.session === 'string' && data.session.length <= 80 && typeof data.transfer === 'string' && data.transfer.length <= 80;
+}
+function sendScreenControl(target, action, session, transfer) {
+  if (!peer || !members.has(target)) return false;
+  const message = {type:'screen-control', target, action, session, transfer};
+  try {
+    if (isHost) {
+      const conn = connections.get(target); if (!conn?.open) return false;
+      conn.send({...message, from:peer.id});
+    } else { if (!hostConnection?.open) return false; hostConnection.send(message); }
+    return true;
+  } catch { return false; }
+}
+function handleScreenControl(from, data) {
+  if (!members.has(from) || !screenPacketValid(data)) return;
+  if (data.action === 'stop') {
+    if (screenReceiveHealth.get(from)?.session !== data.session) return;
+    const incoming = incomingScreenAudio.get(from); incomingScreenAudio.delete(from); clearScreenHealth(screenReceiveHealth, from); incoming?.close();
+    clearAudio('screen-' + from); document.getElementById('video-screen-' + from)?.remove(); renderScreenDiagnostics(); return;
+  }
+  const health = screenSendHealth.get(from);
+  if (!health || health.session !== data.session || health.transfer !== data.transfer || data.session !== screenSession) return;
+  if (data.action === 'ready') { health.confirmed = true; health.status = 'Vídeo recebido'; renderScreenDiagnostics(); return; }
+  // A retry uses the existing capture; it never requests permissions again.
+  if (health.lastRetryAt && Date.now() - health.lastRetryAt < 2000) return;
+  const attempt = health.attempt + 1;
+  clearScreenHealth(screenSendHealth, from);
+  screenAudioCalls.delete(from); health.call.close();
+  sendScreenAudio(from, attempt);
+}
+function clearScreenHealth(map, id) {
+  const health = map.get(id); if (!health) return;
+  clearInterval(health.timer); map.delete(id);
+}
+async function screenStats(call, direction) {
+  const pc = call.peerConnection;
+  if (!pc || pc.connectionState === 'closed') return {connection:'closed', frames:0, bytes:0};
+  const reports = await pc.getStats();
+  const videos = Array.from(reports.values()).filter(report => report.type === direction + '-rtp' && (report.kind || report.mediaType) === 'video' && !report.isRemote);
+  const codec = reports.get(videos[0]?.codecId);
+  return {connection:pc.connectionState, ice:pc.iceConnectionState, frames:videos.reduce((total, report) => total + (report[direction === 'outbound' ? 'framesEncoded' : 'framesDecoded'] || 0), 0), bytes:videos.reduce((total, report) => total + (report[direction === 'outbound' ? 'bytesSent' : 'bytesReceived'] || 0), 0), codec:codec?.mimeType || 'não informado', limitation:videos[0]?.qualityLimitationReason || undefined};
+}
+function renderScreenDiagnostics() {
+  const panel = $('screen-diagnostics'); if (!panel) return;
+  panel.hidden = !displayStream && !screenReceiveHealth.size;
+  const list = $('screen-diagnostics-list'); list.replaceChildren();
+  for (const [direction, map] of [['Envio para',screenSendHealth], ['Recepção de',screenReceiveHealth]]) {
+    for (const [id, health] of map) {
+      const row = document.createElement('p');
+      row.textContent = direction + ' ' + (members.get(id) || 'Participante') + ': ' + health.status + (health.compatible ? ' · modo compatível' : '');
+      list.append(row);
+    }
+  }
+  if (!list.children.length) { const row = document.createElement('p'); row.textContent = 'Aguardando outro participante para confirmar o recebimento.'; list.append(row); }
+}
+function screenReceiveStatus(id, health, message) {
+  health.status = message;
+  const tile = document.getElementById('video-screen-' + id);
+  if (tile && !health.received) { tile.classList.add('video-pending'); tile.querySelector('.screen-pending').textContent = message; }
+  else if (tile) tile.classList.remove('video-pending');
+  renderScreenDiagnostics();
+}
+function requestScreenRetry(id, manual = false) {
+  const health = screenReceiveHealth.get(id);
+  if (!health || health.retryRequested) return;
+  if (!health.supportsRecovery) { screenReceiveStatus(id, health, 'Sem imagem. Os dois participantes precisam atualizar o site para usar a reconexão.'); return; }
+  if (!manual && health.retries >= SCREEN_MAX_RETRIES) {
+    screenReceiveStatus(id, health, 'Não chegou imagem após as tentativas de conexão. Abra Status da transmissão para ver o diagnóstico.'); return;
+  }
+  if (sendScreenControl(id, 'retry', health.session, health.transfer)) {
+    health.retryRequested = true; health.retries++; health.startedAt = Date.now();
+    screenReceiveStatus(id, health, manual ? 'Reconectando transmissão…' : 'Reconectando transmissão (' + health.retries + '/' + SCREEN_MAX_RETRIES + ')…');
+  } else screenReceiveStatus(id, health, 'A conexão com a sala está indisponível.');
+}
+function monitorScreenSend(id, health) {
+  health.timer = setInterval(async () => {
+    if (screenSendHealth.get(id) !== health || health.checking) return;
+    health.checking = true;
+    try {
+      const stats = await screenStats(health.call, 'outbound');
+      if (screenSendHealth.get(id) !== health || screenAudioCalls.get(id) !== health.call) return;
+      health.stats = stats;
+      if (health.compatible && !health.parametersApplied && stats.connection === 'connected') {
+        health.parametersApplied = true;
+        const sender = health.call.peerConnection.getSenders().find(sender => sender.track?.kind === 'video');
+        if (sender) {
+          const parameters = sender.getParameters();
+          if (parameters.encodings?.length) {
+            const settings = sender.track.getSettings();
+            for (const encoding of parameters.encodings) { encoding.maxFramerate = 30; encoding.maxBitrate = 2500000; encoding.scaleResolutionDownBy = Math.max(1, (settings.width || 1280) / 1280, (settings.height || 720) / 720); }
+            try { await sender.setParameters(parameters); health.limitsApplied = true; } catch (err) { console.warn('O navegador não aceitou o limite de envio compatível:', err.name); }
+          }
+        }
+      }
+      if (!health.confirmed) health.status = stats.connection === 'failed' ? 'Falha na conexão com o participante' : Date.now() - health.startedAt > SCREEN_CONNECT_TIMEOUT ? (stats.frames ? 'Enviando vídeo, mas sem confirmação de reprodução' : 'Nenhum quadro de vídeo enviado') : 'Aguardando confirmação de vídeo';
+      renderScreenDiagnostics();
+    } catch (err) { console.warn('Diagnóstico de envio indisponível:', err.name); }
+    finally { health.checking = false; }
+  }, 1000);
+}
+function monitorScreenReceive(id, health) {
+  health.timer = setInterval(async () => {
+    if (screenReceiveHealth.get(id) !== health || health.checking) return;
+    health.checking = true;
+    try {
+      const stats = await screenStats(health.call, 'inbound');
+      if (screenReceiveHealth.get(id) !== health) return;
+      health.stats = stats;
+      const video = document.getElementById('video-screen-' + id)?.querySelector('video');
+      if (!health.received && (stats.frames > 0 || (video?.readyState >= 2 && video.videoWidth > 0 && !video.paused))) {
+        health.received = true;
+        screenReceiveStatus(id, health, 'Vídeo recebido');
+        if (health.supportsRecovery) sendScreenControl(id, 'ready', health.session, health.transfer);
+      }
+      if (!health.received && Date.now() - health.startedAt > SCREEN_CONNECT_TIMEOUT) {
+        if (health.retryRequested) { health.retryRequested = false; screenReceiveStatus(id, health, 'Não foi possível renegociar a transmissão. Tente Reconectar ou copie o diagnóstico.'); }
+        else requestScreenRetry(id);
+      }
+    } catch (err) { console.warn('Diagnóstico de recepção indisponível:', err.name); }
+    finally { health.checking = false; }
+  }, 1000);
+}
+function sendScreenAudio(id, attempt = 0) {
   if (!peer || !displayStream || screenAudioCalls.has(id)) return;
   try {
-    const call = peer.call(id, displayStream, {metadata:{kind:'screen-stream'}});
+    const transfer = crypto.randomUUID();
+    const call = peer.call(id, displayStream, {metadata:{kind:'screen-stream', screenProtocol:2, session:screenSession, transfer, compatible:attempt > 0}, ...(attempt > 0 ? {sdpTransform:preferScreenVP8} : {})});
     if (!call) throw new Error('Chamada de mídia indisponível');
     screenAudioCalls.set(id, call);
-    const cleanup = () => { if (screenAudioCalls.get(id) === call) screenAudioCalls.delete(id); };
+    const health = {call,session:screenSession,transfer,attempt,compatible:attempt > 0,lastRetryAt:attempt ? Date.now() : 0,startedAt:Date.now(),status:'Aguardando confirmação de vídeo'};
+    clearScreenHealth(screenSendHealth, id); screenSendHealth.set(id, health); monitorScreenSend(id, health); renderScreenDiagnostics();
+    const cleanup = () => { if (screenAudioCalls.get(id) === call) { screenAudioCalls.delete(id); clearInterval(health.timer); health.status = 'Conexão de envio encerrada'; renderScreenDiagnostics(); } };
     call.on('close', cleanup);
     call.on('error', err => { if (screenAudioCalls.get(id) !== call) return; cleanup(); call.close(); console.warn('Falha no envio da tela:', err); if (peer) notice('A tela foi capturada, mas não chegou a ' + (members.get(id) || 'um participante') + '. A rede pode estar bloqueando a conexão direta.'); });
   } catch (err) {
@@ -113,12 +257,24 @@ function sendScreenAudio(id) {
 }
 function receiveScreenAudio(call) {
   const id = call.peer;
-  incomingScreenAudio.get(id)?.close(); incomingScreenAudio.set(id, call);
+  const previous = screenReceiveHealth.get(id), oldCall = incomingScreenAudio.get(id);
+  clearScreenHealth(screenReceiveHealth, id); incomingScreenAudio.delete(id); oldCall?.close(); clearAudio('screen-' + id);
+  const oldVideo = document.getElementById('video-screen-' + id)?.querySelector('video'); if (oldVideo) oldVideo.srcObject = null;
+  const metadata = call.metadata || {};
+  const health = {call,session:metadata.session,transfer:metadata.transfer,supportsRecovery:metadata.screenProtocol === 2 && screenPacketValid({action:'ready',...metadata}),compatible:metadata.compatible === true,retries:previous?.session === metadata.session ? previous.retries : 0,startedAt:Date.now(),status:'Conectando transmissão…'};
+  incomingScreenAudio.set(id, call); screenReceiveHealth.set(id, health);
   call.on('stream', stream => { if (incomingScreenAudio.get(id) === call) showScreenAudio(id, stream); });
-  const cleanup = () => { if (incomingScreenAudio.get(id) !== call) return; incomingScreenAudio.delete(id); clearAudio('screen-' + id); document.getElementById('video-screen-' + id)?.remove(); };
+  const cleanup = () => {
+    if (incomingScreenAudio.get(id) !== call) return;
+    incomingScreenAudio.delete(id); clearAudio('screen-' + id);
+    if (!health.received && health.supportsRecovery) { const video = document.getElementById('video-screen-' + id)?.querySelector('video'); if (video) video.srcObject = null; }
+    else { clearScreenHealth(screenReceiveHealth, id); document.getElementById('video-screen-' + id)?.remove(); }
+    renderScreenDiagnostics();
+  };
   call.on('close', cleanup);
-  call.on('error', err => { if (incomingScreenAudio.get(id) !== call) return; cleanup(); call.close(); console.warn('Falha na recepção da tela:', err); if (peer) notice('A conexão da transmissão falhou. Algumas redes precisam de um servidor TURN, ainda não configurado.'); });
-  try { call.answer(); } catch (err) { cleanup(); call.close(); console.warn('Falha ao aceitar transmissão:', err); notice('Não foi possível abrir essa transmissão. Tente usar uma versão atual do Edge ou Chrome.'); }
+  call.on('error', err => { if (incomingScreenAudio.get(id) !== call) return; console.warn('Falha na recepção da tela:', err); if (!health.received) requestScreenRetry(id); cleanup(); call.close(); if (peer) notice('A conexão da transmissão falhou. Se a reconexão também falhar, copie Status da transmissão para investigar a rede.'); });
+  try { call.answer(undefined, metadata.compatible ? {sdpTransform:preferScreenVP8} : {}); monitorScreenReceive(id, health); renderScreenDiagnostics(); }
+  catch (err) { cleanup(); call.close(); console.warn('Falha ao aceitar transmissão:', err); notice('Não foi possível abrir essa transmissão. Tente usar uma versão atual do Edge ou Chrome.'); }
 }
 function videoTile(id, name, stream, local = false) {
   let tile = document.getElementById('video-' + id);
@@ -126,8 +282,8 @@ function videoTile(id, name, stream, local = false) {
   if (!tile) {
     tile = document.createElement('div'); tile.id = 'video-' + id; tile.className = 'tile' + (screen ? ' screen-tile' : ' participant-tile');
     const video = document.createElement('video'); video.autoplay = true; video.playsInline = true; video.muted = true;
-    video.addEventListener('loadeddata', () => { refreshParticipant(id); tile.classList.remove('video-pending'); });
-    video.addEventListener('playing', () => { refreshParticipant(id); tile.classList.remove('video-pending'); });
+    const videoReady = () => { refreshParticipant(id); if (video.readyState >= 2 && video.videoWidth > 0) tile.classList.remove('video-pending'); };
+    video.addEventListener('loadeddata', videoReady); video.addEventListener('playing', videoReady); video.addEventListener('resize', videoReady);
     const label = document.createElement('span'); label.className = 'tile-name';
     const toolbar = document.createElement('div'); toolbar.className = 'tile-toolbar';
     const footer = document.createElement('div'); footer.className = 'tile-footer';
@@ -148,6 +304,9 @@ function videoTile(id, name, stream, local = false) {
       avatar.append(icon, avatarName, state); avatar.onclick = () => highlightTile(tile); tile.append(avatar);
     } else {
       const pending = document.createElement('div'); pending.className = 'screen-pending'; pending.textContent = 'Conectando transmissão…'; tile.append(pending); tile.classList.add('video-pending');
+      if (!local) {
+        const retry = document.createElement('button'); retry.className = 'screen-retry'; retry.textContent = '↻'; retry.title = 'Reconectar transmissão'; retry.setAttribute('aria-label', 'Reconectar transmissão'); retry.onclick = () => requestScreenRetry(id.slice('screen-'.length), true); toolbar.insertBefore(retry, fullscreen);
+      }
     }
     const play = document.createElement('button'); play.className = 'play-video'; play.textContent = '▶ Reproduzir vídeo'; play.hidden = true;
     play.onclick = () => { video.play().then(() => { play.hidden = true; }).catch(() => notice('O navegador não conseguiu reproduzir esse vídeo.')); audioContext?.resume(); };
@@ -220,11 +379,16 @@ function removeMember(id) {
   screenAudioCalls.get(id)?.close(); screenAudioCalls.delete(id); incomingScreenAudio.get(id)?.close(); incomingScreenAudio.delete(id);
   clearAudio('screen-' + id); document.getElementById('video-screen-' + id)?.remove();
   clearAudio(id); clearVoice(id); document.getElementById('video-' + id)?.remove(); updateCount();
+  clearScreenHealth(screenSendHealth, id); clearScreenHealth(screenReceiveHealth, id); renderScreenDiagnostics();
 }
 function handleHostConnection(conn) {
   let admitted = false;
   conn.on('data', data => {
     if (admitted) {
+      if (data?.type === 'screen-control' && screenPacketValid(data) && members.has(data.target)) {
+        if (data.target === peer?.id) handleScreenControl(conn.peer, data);
+        else { const target = connections.get(data.target); if (target?.open) { try { target.send({type:'screen-control',from:conn.peer,action:data.action,session:data.session,transfer:data.transfer}); } catch { console.warn('Não foi possível encaminhar o controle da transmissão.'); } } }
+      }
       if (data?.type === 'profile') { setProfile(conn.peer, data.profile); broadcast({type:'profile', id:conn.peer, profile:profiles.get(conn.peer)}); }
       if (data?.type === 'chat' && validChat(data)) {
         const message = {type:'chat', kind:data.kind, content:data.content, name:members.get(conn.peer)};
@@ -259,6 +423,7 @@ function setupClient(conn) {
     if (data?.type === 'profile' && members.has(data.id)) setProfile(data.id, data.profile);
     if (data?.type === 'left') removeMember(data.id);
     if (data?.type === 'chat') renderChat(data);
+    if (data?.type === 'screen-control') handleScreenControl(data.from, data);
   });
   conn.on('close', () => { if (hostConnection === conn && peer && !peer.destroyed) { alert('A sala foi encerrada porque o anfitrião saiu ou perdeu a conexão.'); leave(); } });
   conn.on('error', () => { if (hostConnection === conn) notice('Conexão com o anfitrião interrompida.'); });
@@ -317,10 +482,13 @@ function resetScreenButton() {
 }
 function stopScreen() {
   screenAttempt++; screenStarting = false;
+  if (screenSession && peer) for (const id of members.keys()) if (id !== peer.id) sendScreenControl(id, 'stop', screenSession, '');
+  screenSession = null;
   const old = displayStream; displayStream = null;
+  for (const id of screenSendHealth.keys()) clearScreenHealth(screenSendHealth, id);
   for (const call of Array.from(screenAudioCalls.values())) call.close(); screenAudioCalls.clear();
   old?.getTracks().forEach(track => { track.onended = null; track.stop(); });
-  document.getElementById('video-screen-local')?.remove(); resetScreenButton(); notice('');
+  document.getElementById('video-screen-local')?.remove(); resetScreenButton(); notice(''); renderScreenDiagnostics();
 }
 async function startScreen(compatible = false) {
   if (screenStarting || displayStream || !peer || $('meeting').hidden) return;
@@ -339,7 +507,7 @@ async function startScreen(compatible = false) {
     if (peer !== activePeer || attempt !== screenAttempt || $('meeting').hidden) { stream.getTracks().forEach(track => track.stop()); return; }
     const track = stream.getVideoTracks()[0];
     if (!track || track.readyState === 'ended') throw new DOMException('Captura sem vídeo', 'NotReadableError');
-    displayStream = stream;
+    displayStream = stream; screenSession = crypto.randomUUID();
     track.onended = () => { if (displayStream === stream) stopScreen(); };
     videoTile('screen-local', 'Sua transmissão', stream, true);
     notice(stream.getAudioTracks().length
@@ -348,7 +516,7 @@ async function startScreen(compatible = false) {
   } catch (err) {
     stream?.getTracks().forEach(track => track.stop());
     if (peer !== activePeer || attempt !== screenAttempt) return;
-    displayStream = null; document.getElementById('video-screen-local')?.remove();
+    displayStream = null; screenSession = null; document.getElementById('video-screen-local')?.remove();
     console.warn('Falha na captura da tela:', err.name, err.message);
     const canRetry = !compatible && ['NotReadableError','OverconstrainedError','AbortError','TypeError'].includes(err.name);
     notice(screenErrorMessage(err), canRetry ? {label:'Tentar modo compatível (sem áudio)', run:() => startScreen(true)} : undefined);
@@ -361,6 +529,7 @@ async function startScreen(compatible = false) {
 function leave() {
   const oldPeer = peer; peer = null; hostConnection = null; if (oldPeer) oldPeer.destroy();
   stopScreen(); clearInterval(placeholderTimer); placeholderTimer = null; cameraOn = false;
+  for (const id of screenReceiveHealth.keys()) clearScreenHealth(screenReceiveHealth, id);
   localStream?.getTracks().forEach(t => t.stop()); displayStream?.getTracks().forEach(t => t.stop());
   for (const call of screenAudioCalls.values()) call.close(); screenAudioCalls.clear();
   for (const call of incomingScreenAudio.values()) call.close(); incomingScreenAudio.clear();
@@ -370,6 +539,7 @@ function leave() {
   $('chat-messages').replaceChildren(); $('chat-input').value = ''; $('chat-panel').hidden = true; $('chat-toggle').textContent = '💬 Chat';
   if (releaseSession) { releaseSession(); releaseSession = null; }
   $('welcome').hidden = false; $('meeting').hidden = true; notice(''); $('screen').textContent = '▤ Compartilhar tela'; $('screen').classList.remove('active'); $('mic').textContent = '🎙 Microfone ligado'; $('camera').textContent = '▣ Câmera ligada'; $('camera').disabled = false;
+  renderScreenDiagnostics();
 }
 $('create').onclick = () => { const url = new URL('sala.html', location.href); url.searchParams.set('sala', crypto.randomUUID().replaceAll('-', '').slice(0, 16)); url.searchParams.set('criar', '1'); location.href = url.href; };
 $('join').onclick = () => { if (!location.pathname.endsWith('/sala.html')) { const code = $('room').value.trim().toLowerCase(); if (!/^[a-z0-9]{1,32}$/.test(code)) { alert('Informe um código de sala válido.'); return; } const url = new URL('sala.html', location.href); url.searchParams.set('sala', code); location.href = url.href; } else start(new URLSearchParams(location.search).has('criar')); }; $('leave').onclick = leave;
@@ -393,6 +563,18 @@ $('screen').onclick = async () => {
   if (displayStream) stopScreen(); else await startScreen();
 };
 $('copy').onclick = async () => { try { const url = new URL('sala.html', location.href); url.searchParams.set('sala', roomCode); await navigator.clipboard.writeText(url.href); $('copy').textContent = 'Copiado!'; setTimeout(() => $('copy').textContent = 'Copiar convite', 2000); } catch { notice('Não foi possível copiar. Compartilhe o código: ' + roomCode); } };
+const diagnostics = document.createElement('details'); diagnostics.id = 'screen-diagnostics'; diagnostics.hidden = true;
+diagnostics.innerHTML = '<summary>Status da transmissão</summary><div id="screen-diagnostics-list"></div><button type="button" id="screen-diagnostics-copy">Copiar diagnóstico</button><small>Não inclui imagens, mensagens, endereços IP ou senhas.</small>';
+$('notice').after(diagnostics);
+function screenDiagnosticReport() {
+  const settings = displayStream?.getVideoTracks()[0]?.getSettings();
+  const entries = map => Array.from(map, ([id, health]) => ({participant:members.get(id) || 'Participante',status:health.status,confirmed:health.confirmed === true || health.received === true,compatible:health.compatible,limitsApplied:health.limitsApplied === true,retries:health.retries ?? health.attempt,stats:health.stats || null}));
+  return {version:'screen-recovery-1',browser:navigator.userAgent,capture:settings ? {width:settings.width,height:settings.height,frameRate:settings.frameRate} : null,sending:entries(screenSendHealth),receiving:entries(screenReceiveHealth)};
+}
+$('screen-diagnostics-copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(JSON.stringify(screenDiagnosticReport(), null, 2)); $('screen-diagnostics-copy').textContent = 'Diagnóstico copiado'; }
+  catch { notice('Não foi possível copiar. Envie uma foto do painel Status da transmissão.'); }
+};
 const chatToggle = document.createElement('button'); chatToggle.id = 'chat-toggle'; chatToggle.textContent = '💬 Chat'; chatToggle.setAttribute('aria-expanded', 'false'); $('meeting').querySelector('.controls').append(chatToggle);
 const chatPanel = document.createElement('aside'); chatPanel.id = 'chat-panel'; chatPanel.hidden = true; chatPanel.setAttribute('aria-label', 'Chat da chamada');
 chatPanel.innerHTML = '<div class="chat-header"><div><strong>Chat da chamada</strong><small>Mensagens disponíveis durante a sessão</small></div><button type="button" id="chat-close" aria-label="Fechar chat">✕</button></div><div id="chat-messages" class="chat-messages" aria-live="polite"></div><p class="chat-info">Cole com Ctrl+V ou envie uma imagem de até 512 KB.</p><form id="chat-form" class="chat-form"><label class="chat-attach" title="Enviar imagem" aria-label="Escolher imagem">＋<input id="chat-file" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden></label><input id="chat-input" type="text" maxlength="1000" placeholder="Digite uma mensagem ou cole uma imagem" aria-label="Mensagem"><button type="submit">Enviar</button></form>';

@@ -16,12 +16,14 @@ O chat da chamada permite texto e imagens JPEG, PNG, WebP ou GIF de até 512 KB,
 - O navegador solicita a seleção da tela ou janela em cada compartilhamento. Para áudio do sistema no Edge/Chrome, escolha a tela inteira e ative a opção de áudio quando disponível.
 - Se a captura falhar por incompatibilidade ou por indisponibilidade do áudio do sistema, o aviso oferece uma tentativa manual em **modo compatível**, sem áudio e sem exigir uma qualidade específica. Negativas de permissão não são contornadas ou repetidas automaticamente.
 - Falhas ao enviar a transmissão a um participante não encerram a captura dos demais. A captura local e a conexão remota são etapas diferentes: conseguir abrir a seleção da tela não garante que a rede permitirá transmitir o vídeo.
+- Se não chegar nenhum quadro de vídeo em cerca de 12 segundos, o receptor solicita até duas reconexões automáticas. Cada reconexão renova somente a conexão daquele participante, mantendo a captura, o áudio da live, o volume e o destaque. O envio tenta VP8 e limites de até 720p/30 fps e 2,5 Mbps quando o navegador aceita esses parâmetros. Os demais espectadores continuam com seu envio original. Isso não substitui um servidor TURN quando a rede bloqueia a conexão direta.
+- O botão **↻** na transmissão permite solicitar uma reconexão manual. O painel **Status da transmissão** distingue o vídeo confirmado pelo receptor do envio sem confirmação. **Copiar diagnóstico** copia estados, contadores de vídeo, codec, dimensões de captura e versão do navegador; não inclui imagens, mensagens do chat, candidatos ICE, endereços de rede ou credenciais.
 
 ## Testes de desenvolvimento
 
 O site não precisa de dependências npm para rodar. Para os testes automatizados, execute `npm ci` e `npm test`. Por padrão, os testes usam o Edge instalado no Windows; `TEST_BROWSER_CHANNEL` pode selecionar outro canal compatível com Playwright.
 
-Os testes usam perfis separados, PeerJS/WebRTC reais e sinalização local com áudio/vídeo gerados, sem acessar microfone, câmera ou tela reais. Cobrem duas transmissões simultâneas, entrada de um terceiro participante, reinício da transmissão, avatares, estados de câmera/microfone, volume independente, erros de captura, modo compatível e altura da página. Não substituem testes em dispositivos e redes diferentes, nem validam a captura real do sistema operacional.
+Os testes usam perfis separados, PeerJS/WebRTC reais e sinalização local com áudio/vídeo gerados, sem acessar microfone, câmera ou tela reais. Cobrem duas transmissões simultâneas, entrada de um terceiro participante, reinício da transmissão, avatares, estados de câmera/microfone, volume independente, erros de captura, modo compatível e altura da página. Incluem falha de vídeo em uma só direção, recuperação entre convidados via anfitrião, limite de tentativas, confirmações antigas e preservação dos codecs/RTX do SDP. Não substituem testes em dispositivos e redes diferentes, nem validam a captura real do sistema operacional.
 
 ## Limitações
 

@@ -152,8 +152,8 @@ test('two simultaneous screen streams, late join, avatars, mic/camera state and 
   await host.locator('#screen').click(); await remoteScreenReady(guest, hostId);
   await host.locator('#leave').click();
   await host.locator('#welcome').waitFor({state:'visible'});
-  const clean = await host.evaluate(() => [profiles.size, screenAudioCalls.size, incomingScreenAudio.size, voiceMonitors.size, placeholderTimer, displayStream]);
-  assert.deepEqual(clean, [0,0,0,0,null,null]);
+  const clean = await host.evaluate(() => [profiles.size, screenAudioCalls.size, incomingScreenAudio.size, screenSendHealth.size, screenReceiveHealth.size, voiceMonitors.size, placeholderTimer, displayStream]);
+  assert.deepEqual(clean, [0,0,0,0,0,0,null,null]);
 });
 test('capture error offers a manual compatible retry, without experimental audio options', async t => {
   const room = 'test' + Date.now();
@@ -205,4 +205,111 @@ test('one recipient failing never tears down a successfully captured screen', as
   assert.equal(await host.evaluate(() => displayStream.getVideoTracks()[0].readyState), 'live');
   assert.match(await host.locator('#screen').textContent(), /Parar/);
   assert.match(await host.locator('#notice').textContent(), /compartilhamento continua ativo/);
+});
+
+async function blockScreenVideo(page, target, everyAttempt = false) {
+  await page.evaluate(({target, everyAttempt}) => {
+    const original = peer.call.bind(peer); window.__screenAttempts = [];
+    peer.call = (id, stream, options) => {
+      const call = original(id, stream, options);
+      if (id === target && options?.metadata?.kind === 'screen-stream') {
+        window.__screenAttempts.push(options.metadata.transfer);
+        if (everyAttempt || window.__screenAttempts.length === 1) {
+          const sender = call.peerConnection.getSenders().find(sender => sender.track?.kind === 'video');
+          sender.replaceTrack(null); // Connected WebRTC/audio, but no outgoing video packets.
+        }
+      }
+      return call;
+    };
+  }, {target, everyAttempt});
+}
+async function connectedWithoutFrames(page, senderId) {
+  await page.waitForFunction(id => {
+    const health = screenReceiveHealth.get(id);
+    return health?.stats?.connection === 'connected' && health.stats.frames === 0 && !health.received;
+  }, senderId);
+}
+async function triggerScreenTimeout(receiver, sender, senderId, receiverId) {
+  // Advance only the watchdog's elapsed time, not media playback/permission time.
+  await sender.evaluate(id => { screenSendHealth.get(id).lastRetryAt = 0; }, receiverId);
+  await receiver.evaluate(id => { screenReceiveHealth.get(id).startedAt -= SCREEN_CONNECT_TIMEOUT + 1; }, senderId);
+}
+test('one-way screen failure reconnects without recapturing or interrupting the opposite stream', {timeout:60000}, async t => {
+  const room = 'test' + Date.now();
+  const host = await client(t, room, true, 'Envia com falha'), guest = await client(t, room, false, 'Recebe');
+  await count(host, 2);
+  const hostId = await host.evaluate(() => peer.id), guestId = await guest.evaluate(() => peer.id);
+  await blockScreenVideo(host, guestId);
+  await guest.locator('#screen').click(); await remoteScreenReady(host, guestId);
+  await host.locator('#screen').click(); await connectedWithoutFrames(guest, hostId);
+  await guest.locator('#video-screen-' + hostId + ' input').fill('150');
+  await guest.locator('#video-screen-' + hostId + ' .feature-button').click();
+  const captureTrack = await host.evaluate(() => displayStream.getVideoTracks()[0].id);
+  await triggerScreenTimeout(guest, host, hostId, guestId);
+  await host.waitForFunction(id => screenSendHealth.get(id)?.confirmed === true && screenSendHealth.get(id)?.limitsApplied === true, guestId);
+  await remoteScreenReady(guest, hostId); await remoteScreenReady(host, guestId);
+  assert.equal(await host.evaluate(() => window.__screenAttempts.length), 2);
+  assert.equal(await host.evaluate(() => window.__captureOptions.length), 1);
+  assert.equal(await host.evaluate(() => displayStream.getVideoTracks()[0].id), captureTrack);
+  assert.equal(await guest.locator('#video-screen-' + hostId + ' input').inputValue(), '150');
+  assert.equal(await guest.locator('#video-screen-' + hostId).evaluate(tile => tile.classList.contains('featured')), true);
+  const repaired = await host.evaluate(id => ({codec:screenSendHealth.get(id).stats.codec, compatible:screenSendHealth.get(id).compatible, report:screenDiagnosticReport()}), guestId);
+  assert.equal(repaired.compatible, true);
+  assert.equal(repaired.codec.toLowerCase(), 'video/vp8');
+  assert.equal(repaired.report.sending[0].confirmed, true);
+  assert.equal(/candidate|ipAddress|sdp|password|deviceId/.test(JSON.stringify(repaired.report)), false);
+  // A late acknowledgement for the failed connection cannot confirm its replacement.
+  const stale = await host.evaluate(id => {
+    const health = screenSendHealth.get(id); health.confirmed = false;
+    handleScreenControl(id, {action:'ready',session:screenSession,transfer:window.__screenAttempts[0]});
+    return health.confirmed;
+  }, guestId);
+  assert.equal(stale, false);
+});
+test('automatic screen recovery stops after two retries and stop clears a failed receiver', {timeout:60000}, async t => {
+  const room = 'test' + Date.now();
+  const host = await client(t, room, true), guest = await client(t, room);
+  await count(host, 2);
+  const hostId = await host.evaluate(() => peer.id), guestId = await guest.evaluate(() => peer.id);
+  await blockScreenVideo(host, guestId, true);
+  await host.locator('#screen').click();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await connectedWithoutFrames(guest, hostId);
+    await triggerScreenTimeout(guest, host, hostId, guestId);
+    await host.waitForFunction(number => window.__screenAttempts.length === number, attempt + 2);
+    const transfer = await host.evaluate(() => window.__screenAttempts.at(-1));
+    await guest.waitForFunction(({id, transfer}) => screenReceiveHealth.get(id)?.transfer === transfer, {id:hostId, transfer});
+  }
+  await connectedWithoutFrames(guest, hostId);
+  await triggerScreenTimeout(guest, host, hostId, guestId);
+  await guest.waitForFunction(id => screenReceiveHealth.get(id)?.status.includes('Não chegou imagem'), hostId);
+  assert.equal(await host.evaluate(() => window.__screenAttempts.length), 3);
+  assert.equal(await guest.locator('#video-screen-' + hostId + ' .screen-retry').isVisible(), true);
+  await host.locator('#screen').click();
+  await guest.locator('#video-screen-' + hostId).waitFor({state:'detached'});
+  assert.equal(await guest.evaluate(id => screenReceiveHealth.has(id), hostId), false);
+  assert.equal(await host.evaluate(() => screenSendHealth.size), 0);
+});
+test('screen recovery between two guests is routed by the host and does not change other recipients', {timeout:60000}, async t => {
+  const room = 'test' + Date.now();
+  const host = await client(t, room, true), sender = await client(t, room, false, 'Transmite'), receiver = await client(t, room, false, 'Assiste');
+  await count(sender, 3); await count(receiver, 3);
+  const hostId = await host.evaluate(() => peer.id), senderId = await sender.evaluate(() => peer.id), receiverId = await receiver.evaluate(() => peer.id);
+  await blockScreenVideo(sender, receiverId);
+  await sender.locator('#screen').click();
+  await remoteScreenReady(host, senderId); await connectedWithoutFrames(receiver, senderId);
+  await triggerScreenTimeout(receiver, sender, senderId, receiverId);
+  await remoteScreenReady(receiver, senderId);
+  await sender.waitForFunction(id => screenSendHealth.get(id)?.confirmed, receiverId);
+  assert.equal(await sender.evaluate(id => screenSendHealth.get(id).compatible, receiverId), true);
+  assert.equal(await sender.evaluate(id => screenSendHealth.get(id).compatible, hostId), false);
+  assert.equal(await sender.evaluate(() => window.__captureOptions.length), 1);
+});
+test('compatible SDP keeps audio, fallback codecs and RTX associations intact', async t => {
+  const page = await client(t);
+  const sdp = ['v=0','m=audio 9 UDP/TLS/RTP/SAVPF 111','a=rtpmap:111 opus/48000/2','m=video 9 UDP/TLS/RTP/SAVPF 102 103 96 97','a=rtpmap:102 H264/90000','a=rtpmap:103 rtx/90000','a=fmtp:103 apt=102','a=rtpmap:96 VP8/90000','a=rtpmap:97 rtx/90000','a=fmtp:97 apt=96','m=application 9 UDP/DTLS/SCTP webrtc-datachannel',''].join('\r\n');
+  const transformed = await page.evaluate(sdp => preferScreenVP8(sdp), sdp);
+  assert.equal(transformed, sdp.replace('m=video 9 UDP/TLS/RTP/SAVPF 102 103 96 97','m=video 9 UDP/TLS/RTP/SAVPF 96 97 102 103'));
+  const noVP8 = sdp.replace('VP8/90000', 'VP9/90000');
+  assert.equal(await page.evaluate(sdp => preferScreenVP8(sdp), noVP8), noVP8);
 });
