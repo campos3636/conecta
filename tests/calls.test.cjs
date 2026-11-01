@@ -89,9 +89,14 @@ async function remoteScreenReady(page, id) {
 }
 test('one name entry, avatar selection and dark full-height layout at desktop/mobile sizes', async t => {
   const page = await client(t);
+  assert.equal(await page.locator('link[rel="icon"]').getAttribute('href'), 'favicon.svg?v=1');
+  const icon = await page.request.get(baseURL + '/favicon.svg?v=1');
+  assert.equal(icon.status(), 200);
+  assert.match(icon.headers()['content-type'], /image\/svg\+xml/);
   assert.equal(await page.locator('#room').isVisible(), false);
   await page.locator('#create').click();
   await page.waitForURL('**/sala.html?**');
+  assert.equal(await page.locator('link[rel="icon"]').getAttribute('href'), 'favicon.svg?v=1');
   assert.equal(await page.locator('#name').isVisible(), true);
   await page.getByRole('button', {name:'Raposa', exact:true}).click();
   await page.locator('#name').fill('Raposa teste');
