@@ -38,6 +38,7 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 .tile-footer .volume-control{position:static;margin-left:auto;pointer-events:auto;padding:4px 6px}
 .screen-pending{position:absolute;inset:40px 10px 55px;display:none;align-items:center;justify-content:center;text-align:center;color:#adbdaf;font-size:13px}
 .video-pending .screen-pending{display:flex}
+.video-pending>video{visibility:hidden}
 .play-video{position:absolute;z-index:4;top:50%;left:50%;transform:translate(-50%,-50%);background:#287c60;color:#fff}
 .notice-action{background:#63552f;color:#fff;border:1px solid #96804b;font-size:12px;padding:8px;flex-shrink:0}
 .videos:has(.featured) .participant-tile{min-height:175px}

@@ -36,27 +36,27 @@ async function client(t, room, host = false, name = 'Teste', avatar = 'Controle'
   t.after(() => context.close());
   const errors = [];
   const peerSource = fs.readFileSync(path.join(__dirname, '../node_modules/peerjs/dist/peerjs.min.js'), 'utf8');
-  await context.route('https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js', route => route.fulfill({contentType:'text/javascript', body:peerSource + `\n{const OriginalPeer=window.Peer;window.Peer=class extends OriginalPeer{constructor(id){super(id,{host:'127.0.0.1',port:${signalPort},secure:false,path:'/',config:{iceServers:[]}})}};}`}));
+  await context.route('https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js', route => route.fulfill({contentType:'text/javascript', body:peerSource + `\n{const OriginalPeer=window.Peer;window.__mediaCalls=0;window.Peer=class extends OriginalPeer{constructor(id,options={}){super(id,{...options,host:'127.0.0.1',port:${signalPort},secure:false,path:'/',config:{...options.config,iceServers:[]}})}call(...args){window.__mediaCalls++;return super.call(...args)}};}`}));
   await context.addInitScript(() => {
     window.__captureOptions = [];
     window.__captureMode = 'normal';
-    window.__makeStream = ({video = false, audio = false}) => {
+    window.__makeStream = ({video = false, audio = false, color = '#21573c', tone = 880}) => {
       const tracks = [];
       if (audio) {
         const ctx = new AudioContext(), oscillator = ctx.createOscillator(), gain = ctx.createGain(), destination = ctx.createMediaStreamDestination();
-        gain.gain.value = 0.01; oscillator.connect(gain).connect(destination); oscillator.start(); ctx.resume(); tracks.push(...destination.stream.getAudioTracks());
+        gain.gain.value = 0.01; oscillator.frequency.value = tone; oscillator.connect(gain).connect(destination); oscillator.start(); ctx.resume(); tracks.push(...destination.stream.getAudioTracks());
       }
       if (video) {
         const canvas = document.createElement('canvas'); canvas.width = 640; canvas.height = 360;
         const ctx = canvas.getContext('2d'); let frame = 0;
-        const paint = () => { ctx.fillStyle = '#21573c'; ctx.fillRect(0,0,640,360); ctx.fillStyle = '#fff'; ctx.font = '28px sans-serif'; ctx.fillText('Transmissão de teste ' + frame++, 50,180); };
+        const paint = () => { ctx.fillStyle = color; ctx.fillRect(0,0,640,360); ctx.fillStyle = '#fff'; ctx.font = '28px sans-serif'; ctx.fillText('Transmissão de teste ' + frame++, 50,180); };
         paint(); const track = canvas.captureStream(15).getVideoTracks()[0];
         const timer = setInterval(() => { if (track.readyState === 'ended') clearInterval(timer); else paint(); }, 65);
         tracks.push(track);
       }
       return new MediaStream(tracks);
     };
-    Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {configurable:true, value:async options => window.__makeStream(options)});
+    Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {configurable:true, value:async options => window.__makeStream({...options,color:'#3a479f',tone:440})});
     Object.defineProperty(navigator.mediaDevices, 'getDisplayMedia', {configurable:true, value:async options => {
       window.__captureOptions.push(options);
       if (window.__captureMode === 'denied') throw new DOMException('Denied for test', 'NotAllowedError');
@@ -84,7 +84,7 @@ async function count(page, number) {
 async function remoteScreenReady(page, id) {
   await page.waitForFunction(id => {
     const video = document.getElementById('video-screen-' + id)?.querySelector('video');
-    return video && video.readyState >= 2 && video.videoWidth > 0 && !video.paused;
+    return video && video.readyState >= 2 && video.videoWidth > 32 && video.videoHeight > 32 && !video.paused && screenReceiveHealth.get(id)?.received === true;
   }, id);
 }
 test('one name entry, avatar selection and dark full-height layout at desktop/mobile sizes', async t => {
@@ -120,7 +120,13 @@ test('two simultaneous screen streams, late join, avatars, mic/camera state and 
   const guest = await client(t, room, false, 'Convidado', 'Panda');
   await count(host, 2); await count(guest, 2);
   const hostId = await host.evaluate(() => peer.id), guestId = await guest.evaluate(() => peer.id);
-  await host.locator('#video-' + guestId + ' .avatar-icon').waitFor();
+  await host.evaluate(id => { window.__initialPC = calls.get(id).peerConnection; }, guestId);
+  await guest.evaluate(id => { window.__initialPC = calls.get(id).peerConnection; }, hostId);
+  try { await host.locator('#video-' + guestId + ' .avatar-icon').waitFor({timeout:8000}); }
+  catch (err) {
+    for (const page of [host,guest]) console.log(JSON.stringify(await page.evaluate(() => ({links:Array.from(mediaLinks, ([id,link]) => ({id,pc:link.call.peerConnection?.connectionState,dc:link.control?.readyState,actualDC:link.call.dataChannel?.readyState,layout:link.remoteLayout,local:link.localLayout,remote:link.remoteStream?.getTracks().map(track => ({id:track.id,kind:track.kind})),participant:link.participantStream.getTracks().length})),notice:document.getElementById('notice').textContent})), null, 2));
+    throw err;
+  }
   assert.equal(await host.locator('#video-' + guestId + ' .avatar-icon').textContent(), '🐼');
   await guest.locator('#mic').click();
   await host.waitForFunction(id => document.getElementById('video-' + id)?.querySelector('.tile-name').textContent.includes('🔇'), guestId);
@@ -132,11 +138,10 @@ test('two simultaneous screen streams, late join, avatars, mic/camera state and 
   await guest.locator('#screen').click(); await remoteScreenReady(host, guestId);
   const later = await client(t, room, false, 'Entrou depois', 'Robô');
   await count(later, 3); await remoteScreenReady(later, hostId); await remoteScreenReady(later, guestId);
-  const stats = await guest.evaluate(async id => {
-    const reports = await incomingScreenAudio.get(id).peerConnection.getStats();
-    return Array.from(reports.values()).filter(report => report.type === 'inbound-rtp' && report.kind === 'video').map(report => report.framesDecoded);
-  }, hostId);
-  assert.ok(stats.some(frames => frames > 0), 'Remote screen frames were decoded');
+  const stats = await guest.evaluate(async id => mediaLinks.get(id).stats('screenVideo','inbound'), hostId);
+  assert.ok(stats.frames > 0, 'Remote screen frames were decoded');
+  const samePC = await guest.evaluate(id => ({same:calls.get(id).peerConnection === window.__initialPC,policy:calls.get(id).peerConnection.getConfiguration().bundlePolicy,transceivers:calls.get(id).peerConnection.getTransceivers().length}), hostId);
+  assert.deepEqual(samePC, {same:true,policy:'max-bundle',transceivers:4});
   await guest.locator('#video-screen-' + hostId + ' input').fill('150');
   await guest.locator('#video-' + hostId + ' input').fill('25');
   const volumes = await guest.evaluate(id => [audioNodes.get('screen-' + id).gain.gain.value, audioNodes.get(id).gain.gain.value], hostId);
@@ -150,10 +155,12 @@ test('two simultaneous screen streams, late join, avatars, mic/camera state and 
   await host.locator('#screen').click();
   await guest.locator('#video-screen-' + hostId).waitFor({state:'detached'});
   await host.locator('#screen').click(); await remoteScreenReady(guest, hostId);
+  assert.equal(await host.evaluate(id => calls.get(id).peerConnection === window.__initialPC, guestId), true);
+  assert.equal(await guest.evaluate(id => calls.get(id).peerConnection === window.__initialPC, hostId), true);
   await host.locator('#leave').click();
   await host.locator('#welcome').waitFor({state:'visible'});
-  const clean = await host.evaluate(() => [profiles.size, screenAudioCalls.size, incomingScreenAudio.size, screenSendHealth.size, screenReceiveHealth.size, voiceMonitors.size, placeholderTimer, displayStream]);
-  assert.deepEqual(clean, [0,0,0,0,0,0,null,null]);
+  const clean = await host.evaluate(() => [profiles.size, mediaLinks.size, screenSendHealth.size, screenReceiveHealth.size, voiceMonitors.size, placeholderTimer, displayStream,screenPlaceholder,silentTrack,silentContext]);
+  assert.deepEqual(clean, [0,0,0,0,0,null,null,null,null,null]);
 });
 test('capture error offers a manual compatible retry, without experimental audio options', async t => {
   const room = 'test' + Date.now();
@@ -196,30 +203,28 @@ test('leaving during the screen picker stops late tracks and does not reopen the
 });
 test('one recipient failing never tears down a successfully captured screen', async t => {
   const room = 'test' + Date.now();
-  const host = await client(t, room, true), guest = await client(t, room);
-  await count(host, 2);
-  await host.waitForFunction(() => calls.size === 1);
-  await host.evaluate(() => { const original = peer.call.bind(peer); peer.call = (id, stream, options) => { if (options?.metadata?.kind === 'screen-stream') throw new Error('Simulated recipient failure'); return original(id,stream,options); }; });
+  const host = await client(t, room, true), guest = await client(t, room), healthy = await client(t, room);
+  await count(host, 3);
+  const guestId = await guest.evaluate(() => peer.id), hostId = await host.evaluate(() => peer.id);
+  await host.waitForFunction(() => mediaLinks.size === 2);
+  await host.evaluate(id => { const link = mediaLinks.get(id), original = link.replaceSlot.bind(link); link.replaceSlot = (slot,track) => { if (slot === 'screenVideo' && track !== screenPlaceholder) return Promise.reject(new Error('Simulated recipient failure')); return original(slot,track); }; }, guestId);
   await host.locator('#screen').click();
   await host.locator('#video-screen-local').waitFor();
+  await remoteScreenReady(healthy, hostId);
   assert.equal(await host.evaluate(() => displayStream.getVideoTracks()[0].readyState), 'live');
   assert.match(await host.locator('#screen').textContent(), /Parar/);
-  assert.match(await host.locator('#notice').textContent(), /compartilhamento continua ativo/);
+  assert.match(await host.locator('#notice').textContent(), /captura continua ativa/);
 });
 
 async function blockScreenVideo(page, target, everyAttempt = false) {
   await page.evaluate(({target, everyAttempt}) => {
-    const original = peer.call.bind(peer); window.__screenAttempts = [];
-    peer.call = (id, stream, options) => {
-      const call = original(id, stream, options);
-      if (id === target && options?.metadata?.kind === 'screen-stream') {
-        window.__screenAttempts.push(options.metadata.transfer);
-        if (everyAttempt || window.__screenAttempts.length === 1) {
-          const sender = call.peerConnection.getSenders().find(sender => sender.track?.kind === 'video');
-          sender.replaceTrack(null); // Connected WebRTC/audio, but no outgoing video packets.
-        }
+    const link = mediaLinks.get(target), original = link.replaceSlot.bind(link); window.__screenAttempts = [];
+    link.replaceSlot = (slot, track) => {
+      if (slot === 'screenVideo' && track !== screenPlaceholder) {
+        window.__screenAttempts.push(link.desired.transfer);
+        if (everyAttempt || window.__screenAttempts.length === 1) return original(slot, null);
       }
-      return call;
+      return original(slot, track);
     };
   }, {target, everyAttempt});
 }
@@ -231,7 +236,7 @@ async function connectedWithoutFrames(page, senderId) {
 }
 async function triggerScreenTimeout(receiver, sender, senderId, receiverId) {
   // Advance only the watchdog's elapsed time, not media playback/permission time.
-  await sender.evaluate(id => { screenSendHealth.get(id).lastRetryAt = 0; }, receiverId);
+  await sender.evaluate(id => { mediaLinks.get(id).lastRetryAt = 0; }, receiverId);
   await receiver.evaluate(id => { screenReceiveHealth.get(id).startedAt -= SCREEN_CONNECT_TIMEOUT + 1; }, senderId);
 }
 test('one-way screen failure reconnects without recapturing or interrupting the opposite stream', {timeout:60000}, async t => {
@@ -259,9 +264,9 @@ test('one-way screen failure reconnects without recapturing or interrupting the 
   assert.equal(repaired.report.sending[0].confirmed, true);
   assert.equal(/candidate|ipAddress|sdp|password|deviceId/.test(JSON.stringify(repaired.report)), false);
   // A late acknowledgement for the failed connection cannot confirm its replacement.
-  const stale = await host.evaluate(id => {
+  const stale = await host.evaluate(async id => {
     const health = screenSendHealth.get(id); health.confirmed = false;
-    handleScreenControl(id, {action:'ready',session:screenSession,transfer:window.__screenAttempts[0]});
+    await mediaLinks.get(id).handleMessage(JSON.stringify({protocol:CamposMediaLink.protocol,type:'seen',session:screenSession,transfer:window.__screenAttempts[0]}));
     return health.confirmed;
   }, guestId);
   assert.equal(stale, false);
@@ -290,7 +295,7 @@ test('automatic screen recovery stops after two retries and stop clears a failed
   assert.equal(await guest.evaluate(id => screenReceiveHealth.has(id), hostId), false);
   assert.equal(await host.evaluate(() => screenSendHealth.size), 0);
 });
-test('screen recovery between two guests is routed by the host and does not change other recipients', {timeout:60000}, async t => {
+test('screen recovery between two guests uses their media link and does not change other recipients', {timeout:60000}, async t => {
   const room = 'test' + Date.now();
   const host = await client(t, room, true), sender = await client(t, room, false, 'Transmite'), receiver = await client(t, room, false, 'Assiste');
   await count(sender, 3); await count(receiver, 3);
@@ -304,6 +309,98 @@ test('screen recovery between two guests is routed by the host and does not chan
   assert.equal(await sender.evaluate(id => screenSendHealth.get(id).compatible, receiverId), true);
   assert.equal(await sender.evaluate(id => screenSendHealth.get(id).compatible, hostId), false);
   assert.equal(await sender.evaluate(() => window.__captureOptions.length), 1);
+});
+test('camera, microphone and live audio/video stay separate on one unchanged ICE transport', {timeout:60000}, async t => {
+  const room = 'test' + Date.now();
+  const host = await client(t, room, true), guest = await client(t, room);
+  await count(host, 2);
+  const hostId = await host.evaluate(() => peer.id), guestId = await guest.evaluate(() => peer.id);
+  await host.waitForFunction(id => mediaLinks.get(id)?.control?.readyState === 'open', guestId);
+  await guest.waitForFunction(id => mediaLinks.get(id)?.control?.readyState === 'open', hostId);
+  // Any regression to a separate media call must fail this test immediately.
+  for (const [page,id] of [[host,guestId],[guest,hostId]]) await page.evaluate(id => { window.__savedMediaPC = calls.get(id).peerConnection; window.__savedCallCount = window.__mediaCalls; peer.call = () => { throw new Error('An extra media connection was attempted'); }; }, id);
+  await host.evaluate(id => {
+    const sender = mediaLinks.get(id).senders.screenVideo, original = sender.setParameters.bind(sender); window.__rejectedLimit = false;
+    sender.setParameters = parameters => {
+      if (!window.__rejectedLimit && parameters.encodings.some(encoding => encoding.active && encoding.maxFramerate === 60)) { window.__rejectedLimit = true; return Promise.reject(new DOMException('Unsupported limit for test','InvalidModificationError')); }
+      return original(parameters);
+    };
+  }, guestId);
+  await host.locator('#screen').click(); await remoteScreenReady(guest, hostId);
+  assert.equal(await host.evaluate(() => window.__rejectedLimit), true);
+  await host.locator('#camera').click(); await guest.locator('#video-' + hostId + '.camera-visible').waitFor();
+  await guest.waitForFunction(id => {
+    const video = document.querySelector('#video-' + id + ' video'), canvas = document.createElement('canvas'); canvas.width = canvas.height = 1;
+    const ctx = canvas.getContext('2d'); ctx.drawImage(video,10,10,1,1,0,0,1,1); const rgb = ctx.getImageData(0,0,1,1).data;
+    return rgb[2] > rgb[1] + 40;
+  }, hostId);
+  const sample = await guest.evaluate(id => {
+    const pixel = selector => { const video = document.querySelector(selector); const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1; const ctx = canvas.getContext('2d'); ctx.drawImage(video,10,10,1,1,0,0,1,1); return [...ctx.getImageData(0,0,1,1).data].slice(0,3); };
+    const link = mediaLinks.get(id), pc = link.call.peerConnection, transports = pc.getTransceivers().map(item => item.sender.transport);
+    return {camera:pixel('#video-' + id + ' video'),screen:pixel('#video-screen-' + id + ' video'),same:pc === window.__savedMediaPC,oneTransport:transports.every(transport => transport === transports[0]) && pc.sctp.transport === transports[0],cameraAudio:link.participantStream.getAudioTracks()[0].id,liveAudio:link.screenStream.getAudioTracks()[0].id};
+  }, hostId);
+  assert.equal(sample.same, true); assert.equal(sample.oneTransport, true);
+  assert.notEqual(sample.cameraAudio, sample.liveAudio);
+  assert.ok(sample.camera[2] > sample.camera[1] + 40, 'Camera contains the blue test pattern');
+  assert.ok(sample.screen[1] > sample.screen[2] + 15, 'Live contains the green test pattern');
+  await guest.evaluate(id => {
+    const link = mediaLinks.get(id); window.__toneChecks = [link.participantStream,link.screenStream].map(stream => { const source = audioContext.createMediaStreamSource(stream), analyser = audioContext.createAnalyser(); analyser.fftSize = 4096; source.connect(analyser); return {source,analyser}; });
+  }, hostId);
+  await guest.waitForFunction(() => {
+    const peaks = window.__toneChecks.map(({analyser}) => { const values = new Uint8Array(analyser.frequencyBinCount); analyser.getByteFrequencyData(values); const max = Math.max(...values); return max ? values.indexOf(max) * audioContext.sampleRate / analyser.fftSize : 0; });
+    return peaks[0] > 410 && peaks[0] < 470 && peaks[1] > 850 && peaks[1] < 910;
+  });
+  await host.locator('#mic').click();
+  assert.equal(await host.evaluate(() => localStream.getAudioTracks()[0].enabled), false);
+  assert.equal(await host.evaluate(() => displayStream.getAudioTracks()[0].enabled), true);
+  await host.locator('#camera').click(); await host.locator('#screen').click();
+  await guest.locator('#video-screen-' + hostId).waitFor({state:'detached'});
+  await host.locator('#screen').click(); await remoteScreenReady(guest, hostId);
+  await guest.locator('#screen').click(); await remoteScreenReady(host, guestId);
+  await guest.locator('#video-screen-' + hostId + ' .screen-retry').click();
+  await host.waitForFunction(id => screenSendHealth.get(id)?.compatible && screenSendHealth.get(id)?.confirmed, guestId);
+  await guest.evaluate(async id => {
+    const link = mediaLinks.get(id), transfer = link.remoteState.transfer;
+    await link.handleMessage('null'); await link.handleMessage('[]'); await link.handleMessage('{');
+    await link.handleMessage(JSON.stringify({protocol:CamposMediaLink.protocol,type:'state',revision:link.remoteRevision-1,layout:link.remoteLayout,screen:{phase:'off'}}));
+    if (link.remoteState.transfer !== transfer) throw new Error('Stale state replaced the current screen');
+  }, hostId);
+  for (const [page,id] of [[host,guestId],[guest,hostId]]) assert.equal(await page.evaluate(id => calls.get(id).peerConnection === window.__savedMediaPC && window.__mediaCalls === window.__savedCallCount, id), true);
+  await guest.evaluate(() => window.__toneChecks.forEach(({source,analyser}) => { source.disconnect(); analyser.disconnect(); }));
+});
+test('simultaneous joins connect every admitted peer before screens are attached', {timeout:60000}, async t => {
+  const room = 'test' + Date.now();
+  const host = await client(t, room, true);
+  const [a,b] = await Promise.all([client(t, room, false, 'Pessoa A'),client(t, room, false, 'Pessoa B')]);
+  for (const page of [host,a,b]) {
+    await count(page, 3);
+    await page.waitForFunction(() => mediaLinks.size === 2 && [...mediaLinks.values()].every(link => link.control?.readyState === 'open' && link.participantStream.getTracks().length === 2));
+  }
+  const aId = await a.evaluate(() => peer.id), bId = await b.evaluate(() => peer.id);
+  await a.locator('#screen').click(); await b.locator('#screen').click();
+  await remoteScreenReady(a,bId); await remoteScreenReady(b,aId);
+  await remoteScreenReady(host,aId); await remoteScreenReady(host,bId);
+});
+test('an unadmitted media offer is never answered or given the active screen', {timeout:30000}, async t => {
+  const room = 'test' + Date.now();
+  const host = await client(t, room, true), guest = await client(t, room), outsider = await client(t);
+  await count(host, 2);
+  const hostId = await host.evaluate(() => peer.id);
+  await host.locator('#screen').click(); await remoteScreenReady(guest, hostId);
+  const outsiderId = await outsider.evaluate(hostId => new Promise(resolve => {
+    const separatePeer = new Peer(); window.__outsiderPeer = separatePeer; separatePeer.on('error', () => {});
+    separatePeer.on('open', id => {
+      const media = window.__makeStream({video:true,audio:true}), video = media.getVideoTracks()[0], audio = media.getAudioTracks()[0];
+      const pack = CamposMediaLink.pack({microphone:audio,camera:video,screenVideo:video.clone(),screenAudio:audio.clone()});
+      window.__outsiderCall = separatePeer.call(hostId,pack.stream,{metadata:{mediaProtocol:CamposMediaLink.protocol}}); resolve(id);
+    });
+  }), hostId);
+  await host.waitForFunction(id => pendingMediaCalls.has(id), outsiderId);
+  assert.equal(await host.evaluate(id => mediaLinks.has(id) || members.has(id), outsiderId), false);
+  await host.waitForFunction(id => !pendingMediaCalls.has(id), outsiderId);
+  assert.equal(await host.evaluate(() => mediaLinks.size), 1);
+  assert.equal(await outsider.evaluate(() => __outsiderCall.peerConnection.remoteDescription), null);
+  await remoteScreenReady(guest,hostId);
 });
 test('compatible SDP keeps audio, fallback codecs and RTX associations intact', async t => {
   const page = await client(t);
