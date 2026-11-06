@@ -39,6 +39,7 @@ async function client(t, room, host = false, name = 'Teste', avatar = 'Controle'
   await context.route('https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js', route => route.fulfill({contentType:'text/javascript', body:peerSource + `\n{const OriginalPeer=window.Peer;window.__mediaCalls=0;window.Peer=class extends OriginalPeer{constructor(id,options={}){super(id,{...options,host:'127.0.0.1',port:${signalPort},secure:false,path:'/',config:{...options.config,iceServers:[]}})}call(...args){window.__mediaCalls++;return super.call(...args)}};}`}));
   await context.addInitScript(() => {
     window.__captureOptions = [];
+    window.__microphoneOptions = [];
     window.__captureMode = 'normal';
     window.__makeStream = ({video = false, audio = false, color = '#21573c', tone = 880}) => {
       const tracks = [];
@@ -56,13 +57,17 @@ async function client(t, room, host = false, name = 'Teste', avatar = 'Controle'
       }
       return new MediaStream(tracks);
     };
-    Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {configurable:true, value:async options => window.__makeStream({...options,color:'#3a479f',tone:440})});
+    Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {configurable:true, value:async options => { if (options.audio) window.__microphoneOptions.push(options.audio); return window.__makeStream({...options,color:'#3a479f',tone:440}); }});
     Object.defineProperty(navigator.mediaDevices, 'getDisplayMedia', {configurable:true, value:async options => {
       window.__captureOptions.push(options);
       if (window.__captureMode === 'denied') throw new DOMException('Denied for test', 'NotAllowedError');
       if (window.__captureMode === 'fail-audio' && options.audio) throw new DOMException('System capture failed for test', 'NotReadableError');
       if (window.__captureMode === 'deferred') return new Promise(resolve => { window.__finishCapture = () => { window.__lateStream = window.__makeStream(options); resolve(window.__lateStream); }; });
-      return window.__makeStream(options);
+      const audio = window.__captureMode === 'no-audio-monitor' && options.video.displaySurface === 'monitor' ? false : options.audio;
+      const stream = window.__makeStream({...options,audio});
+      const track = stream.getVideoTracks()[0], settings = track.getSettings.bind(track);
+      track.getSettings = () => ({...settings(),displaySurface:options.video.displaySurface || 'monitor'});
+      return stream;
     }});
   });
   const page = await context.newPage();
@@ -175,6 +180,9 @@ test('capture error offers a manual compatible retry, without experimental audio
   await page.locator('#video-screen-local').waitFor();
   const options = await page.evaluate(() => window.__captureOptions);
   assert.equal(options[0].video.frameRate.ideal, 60);
+  assert.equal(options[0].video.displaySurface, 'monitor');
+  assert.equal(options[0].systemAudio, 'include');
+  assert.deepEqual(options[0].audio, {echoCancellation:false,noiseSuppression:false,autoGainControl:false,suppressLocalAudioPlayback:false});
   assert.equal('windowAudio' in options[0], false);
   assert.deepEqual(options[1], {video:true,audio:false});
   assert.equal(await page.locator('#screen').isDisabled(), false);
@@ -207,7 +215,7 @@ test('one recipient failing never tears down a successfully captured screen', as
   await count(host, 3);
   const guestId = await guest.evaluate(() => peer.id), hostId = await host.evaluate(() => peer.id);
   await host.waitForFunction(() => mediaLinks.size === 2);
-  await host.evaluate(id => { const link = mediaLinks.get(id), original = link.replaceSlot.bind(link); link.replaceSlot = (slot,track) => { if (slot === 'screenVideo' && track !== screenPlaceholder) return Promise.reject(new Error('Simulated recipient failure')); return original(slot,track); }; }, guestId);
+  await host.evaluate(id => { const link = mediaLinks.get(id), original = link.replaceSlot.bind(link); link.replaceSlot = (slot,track,...args) => { if (slot === 'screenVideo' && track !== screenPlaceholder) return Promise.reject(new Error('Simulated recipient failure')); return original(slot,track,...args); }; }, guestId);
   await host.locator('#screen').click();
   await host.locator('#video-screen-local').waitFor();
   await remoteScreenReady(healthy, hostId);
@@ -219,12 +227,12 @@ test('one recipient failing never tears down a successfully captured screen', as
 async function blockScreenVideo(page, target, everyAttempt = false) {
   await page.evaluate(({target, everyAttempt}) => {
     const link = mediaLinks.get(target), original = link.replaceSlot.bind(link); window.__screenAttempts = [];
-    link.replaceSlot = (slot, track) => {
+    link.replaceSlot = (slot, track, ...args) => {
       if (slot === 'screenVideo' && track !== screenPlaceholder) {
         window.__screenAttempts.push(link.desired.transfer);
-        if (everyAttempt || window.__screenAttempts.length === 1) return original(slot, null);
+        if (everyAttempt || window.__screenAttempts.length === 1) return original(slot, null, ...args);
       }
-      return original(slot, track);
+      return original(slot, track, ...args);
     };
   }, {target, everyAttempt});
 }
@@ -380,6 +388,53 @@ test('simultaneous joins connect every admitted peer before screens are attached
   await a.locator('#screen').click(); await b.locator('#screen').click();
   await remoteScreenReady(a,bId); await remoteScreenReady(b,aId);
   await remoteScreenReady(host,aId); await remoteScreenReady(host,bId);
+});
+test('missing captured audio is reported truthfully and an explicit tab retry keeps the media connection', {timeout:60000}, async t => {
+  const room = 'test' + Date.now();
+  const host = await client(t,room,true), guest = await client(t,room);
+  await count(host,2);
+  const hostId = await host.evaluate(() => peer.id), guestId = await guest.evaluate(() => peer.id);
+  await host.evaluate(id => { window.__audioPC = calls.get(id).peerConnection; window.__audioCallCount = window.__mediaCalls; window.__captureMode = 'no-audio-monitor'; }, guestId);
+  await host.locator('#screen').click(); await remoteScreenReady(guest,hostId);
+  const initial = await host.evaluate(() => screenDiagnosticReport());
+  assert.equal(initial.capture.audio.status, 'not-returned'); assert.equal(initial.capture.audio.trackCount, 0);
+  assert.equal(initial.capture.audio.requested, true); assert.equal(initial.capture.displaySurface, 'monitor');
+  assert.match(await host.locator('#notice').textContent(), /não forneceu uma faixa de áudio/);
+  assert.doesNotMatch(await host.locator('#notice').textContent(), /não autorizado|permissão negada/);
+  assert.equal(await guest.evaluate(id => screenReceiveHealth.get(id).hasAudio,hostId), false);
+  assert.equal(await host.evaluate(() => window.__captureOptions.length),1, 'No automatic re-request for audio');
+  await host.getByRole('button',{name:'Trocar para guia com áudio',exact:true}).click();
+  await remoteScreenReady(guest,hostId);
+  await guest.waitForFunction(id => screenReceiveHealth.get(id)?.hasAudio && screenReceiveHealth.get(id)?.audioStats?.bytes > 0 && screenReceiveHealth.get(id)?.audioStats?.receivedSignalLevel > 0,hostId);
+  const report = await host.evaluate(id => ({report:screenDiagnosticReport(),same:calls.get(id).peerConnection === window.__audioPC,calls:window.__mediaCalls === window.__audioCallCount,options:window.__captureOptions,mic:window.__microphoneOptions[0]}),guestId);
+  assert.equal(report.report.capture.audio.status,'available'); assert.equal(report.report.capture.preferredSurface,'browser');
+  assert.equal(report.options[1].video.displaySurface,'browser'); assert.equal(report.options.length,2);
+  assert.equal(report.mic.echoCancellation,true); assert.equal(report.mic.noiseSuppression,true);
+  assert.equal(report.same,true); assert.equal(report.calls,true);
+  assert.equal(/deviceId|groupId|ipAddress|password|sdp/.test(JSON.stringify(report.report)),false);
+  await guest.locator('#screen-diagnostics summary').click();
+  const suspended = await guest.evaluate(async () => { await audioContext.suspend(); renderScreenDiagnostics(); return {state:audioContext.state,buttonHidden:document.getElementById('audio-playback-resume').hidden}; });
+  assert.deepEqual(suspended,{state:'suspended',buttonHidden:false});
+  // Chromium can itself resume after a trusted user interaction. Both paths
+  // are valid; a suspended context must never leave its resume button hidden.
+  if (await guest.locator('#audio-playback-resume').isVisible()) await guest.locator('#audio-playback-resume').click();
+  else assert.equal(await guest.evaluate(() => audioContext.state),'running');
+  await guest.waitForFunction(() => audioContext.state === 'running');
+});
+test('an ended screen-audio track updates both clients without stopping video or microphone', {timeout:60000}, async t => {
+  const room = 'test' + Date.now();
+  const host = await client(t,room,true), guest = await client(t,room);
+  await count(host,2);
+  const hostId = await host.evaluate(() => peer.id);
+  await host.locator('#screen').click(); await remoteScreenReady(guest,hostId);
+  await guest.waitForFunction(id => screenReceiveHealth.get(id)?.hasAudio,hostId);
+  await host.evaluate(() => { const audio = displayStream.getAudioTracks()[0]; audio.stop(); audio.dispatchEvent(new Event('ended')); });
+  await guest.waitForFunction(id => screenReceiveHealth.get(id)?.hasAudio === false,hostId);
+  assert.equal(await host.evaluate(() => captureAudioInfo().status),'ended');
+  assert.equal(await host.evaluate(() => displayStream.getVideoTracks()[0].readyState),'live');
+  assert.equal(await host.evaluate(() => localStream.getAudioTracks()[0].enabled),true);
+  assert.match(await host.locator('#notice').textContent(),/áudio da transmissão foi interrompida/);
+  await remoteScreenReady(guest,hostId);
 });
 test('an unadmitted media offer is never answered or given the active screen', {timeout:30000}, async t => {
   const room = 'test' + Date.now();

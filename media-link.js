@@ -3,6 +3,7 @@
 (() => {
   const SLOTS = {microphone:'audio', camera:'video', screenVideo:'video', screenAudio:'audio'};
   const PROTOCOL = 3;
+  const liveAudio = stream => stream?.getAudioTracks().find(track => track.readyState === 'live' && track.enabled);
   function pack(tracks) {
     const layout = {};
     for (const [slot, kind] of Object.entries(SLOTS)) {
@@ -30,7 +31,7 @@
       this.remoteRevision = -1;
       this.remoteState = null;
       this.closed = false;
-      this.desired = {stream:null, session:null, transfer:'', compatible:false};
+      this.desired = {stream:null, session:null, transfer:'', compatible:false,phase:'off'};
       this.participantStream = new MediaStream();
       this.screenStream = new MediaStream();
       this.onRemoteTrack = () => this.refreshRemote();
@@ -64,7 +65,7 @@
       const transceivers = this.call.peerConnection?.getTransceivers() || [];
       const layout = Object.fromEntries(Object.keys(SLOTS).map(slot => [slot, transceivers.find(item => item.sender === this.senders[slot])?.mid]));
       if (!validLayout(layout)) return false;
-      return this.send({type:'state', revision:++this.revision, layout, screen:{phase,session:desired.session,transfer:desired.transfer,compatible:desired.compatible,hasAudio:!!desired.stream?.getAudioTracks().length}});
+      return this.send({type:'state', revision:++this.revision, layout, screen:{phase,session:desired.session,transfer:desired.transfer,compatible:desired.compatible,hasAudio:!!liveAudio(desired.stream)}});
     }
     cancelPending() {
       if (this.pending) { clearTimeout(this.pending.timer); this.pending.resolve(false); this.pending = null; }
@@ -75,12 +76,12 @@
       this.cancelPending();
       const epoch = ++this.screenEpoch;
       if (session !== this.desired.session) this.recoveryCount = 0;
-      this.desired = {stream, session, compatible, attempt:this.recoveryCount, transfer:stream ? crypto.randomUUID() : ''};
+      this.desired = {stream, session, compatible, attempt:this.recoveryCount, transfer:stream ? crypto.randomUUID() : '',phase:stream ? 'prepare' : 'off'};
       const desired = this.desired;
       if (!stream) {
         this.sendState('off');
         await this.configureScreen(false);
-        await Promise.all([this.replaceSlot('screenVideo', this.idleTracks.screenVideo), this.replaceSlot('screenAudio', this.idleTracks.screenAudio)]);
+        await Promise.all([this.replaceSlot('screenVideo', this.idleTracks.screenVideo, epoch), this.replaceSlot('screenAudio', this.idleTracks.screenAudio, epoch)]);
         return;
       }
       const baseline = await this.stats('screenVideo', 'outbound');
@@ -90,7 +91,7 @@
       // Pause only the screen sender while the receiver records its counters.
       // The microphone, camera and opposite screen never stop.
       await this.configureScreen(false);
-      await this.replaceSlot('screenVideo', this.idleTracks.screenVideo);
+      await this.replaceSlot('screenVideo', this.idleTracks.screenVideo, epoch);
       if (this.closed || epoch !== this.screenEpoch) return;
       const accepted = new Promise(resolve => {
         const timer = setTimeout(() => { if (this.pending?.epoch === epoch) this.pending = null; resolve(false); }, 6000);
@@ -102,18 +103,24 @@
         return;
       }
       await Promise.all([
-        this.replaceSlot('screenVideo', stream.getVideoTracks()[0]),
-        this.replaceSlot('screenAudio', stream.getAudioTracks()[0] || this.idleTracks.screenAudio)
+        this.replaceSlot('screenVideo', stream.getVideoTracks()[0], epoch),
+        this.replaceSlot('screenAudio', liveAudio(stream) || this.idleTracks.screenAudio, epoch)
       ]);
       if (this.closed || epoch !== this.screenEpoch) return;
       const limitsApplied = await this.configureScreen(true, compatible);
       if (this.closed || epoch !== this.screenEpoch) return;
-      this.sendState('live');
+      desired.phase = 'live'; this.sendState('live');
       this.callbacks.onLocalScreen?.({...desired, phase:'live', baseline, limitsApplied});
     }
-    replaceSlot(slot, track) {
+    async refreshAudio() {
+      const desired = this.desired, epoch = this.screenEpoch;
+      if (this.closed || desired.phase !== 'live') return;
+      await this.replaceSlot('screenAudio', liveAudio(desired.stream) || this.idleTracks.screenAudio, epoch);
+      if (!this.closed && this.desired === desired && desired.phase === 'live') this.sendState('live');
+    }
+    replaceSlot(slot, track, epoch) {
       const operation = (this.slotQueues[slot] || Promise.resolve()).then(async () => {
-        if (this.closed) return;
+        if (this.closed || (epoch !== undefined && epoch !== this.screenEpoch)) return;
         const sender = this.senders[slot];
         if (!sender) throw new Error('Faixa não negociada: ' + slot);
         if (sender.track !== track) await sender.replaceTrack(track);
@@ -227,7 +234,8 @@
       const reports = typeof endpoint.getStats === 'function' ? await endpoint.getStats() : await pc.getStats(endpoint.track);
       const media = Array.from(reports.values()).filter(report => report.type === direction + '-rtp' && !report.isRemote && (report.kind || report.mediaType) === SLOTS[slot] && (report.mid === undefined || transceiver.mid === null || report.mid === transceiver.mid));
       const codec = reports.get(media[0]?.codecId);
-      return {connection:pc.connectionState,ice:pc.iceConnectionState,frames:media.reduce((sum, report) => sum + (report[direction === 'outbound' ? 'framesEncoded' : 'framesDecoded'] || 0),0),bytes:media.reduce((sum, report) => sum + (report[direction === 'outbound' ? 'bytesSent' : 'bytesReceived'] || 0),0),width:media[0]?.frameWidth || 0,height:media[0]?.frameHeight || 0,codec:codec?.mimeType || 'não informado',limitation:media[0]?.qualityLimitationReason,counterKey:media.map(report => report.id).sort().join(',')};
+      const source = reports.get(media[0]?.mediaSourceId);
+      return {connection:pc.connectionState,ice:pc.iceConnectionState,frames:media.reduce((sum, report) => sum + (report[direction === 'outbound' ? 'framesEncoded' : 'framesDecoded'] || 0),0),bytes:media.reduce((sum, report) => sum + (report[direction === 'outbound' ? 'bytesSent' : 'bytesReceived'] || 0),0),packets:media.reduce((sum, report) => sum + (report[direction === 'outbound' ? 'packetsSent' : 'packetsReceived'] || 0),0),audioLevel:media[0]?.audioLevel ?? source?.audioLevel,totalAudioEnergy:media[0]?.totalAudioEnergy ?? source?.totalAudioEnergy,width:media[0]?.frameWidth || 0,height:media[0]?.frameHeight || 0,codec:codec?.mimeType || 'não informado',limitation:media[0]?.qualityLimitationReason,counterKey:media.map(report => report.id).sort().join(',')};
     }
     dispose() {
       if (this.closed) return;

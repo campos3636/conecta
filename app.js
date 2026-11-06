@@ -15,6 +15,7 @@ const pendingMediaCalls = new Map();
 const screenSendHealth = new Map(), screenReceiveHealth = new Map();
 let screenPlaceholder, silentTrack, silentSource, silentContext;
 let screenSession = null;
+let captureRequest = null;
 const SCREEN_CONNECT_TIMEOUT = 12000, SCREEN_MAX_RETRIES = 2;
 const profiles = new Map();
 const AVATARS = [
@@ -85,13 +86,20 @@ function highlightTile(tile) {
   document.querySelectorAll('#videos .featured').forEach(item => { item.classList.remove('featured'); const button = item.querySelector('.feature-button'); if (button) { button.textContent = '☆ Destacar'; button.setAttribute('aria-pressed', 'false'); } });
   if (!selected) { tile.classList.add('featured'); const button = tile.querySelector('.feature-button'); button.textContent = '★ Em destaque'; button.setAttribute('aria-pressed', 'true'); }
 }
-function clearAudio(id) { const node = audioNodes.get(id); if (node) { node.source.disconnect(); node.gain.disconnect(); audioNodes.delete(id); } }
+function clearAudio(id) { const node = audioNodes.get(id); if (node) { node.source.disconnect(); node.gain.disconnect(); node.analyser?.disconnect(); audioNodes.delete(id); } }
+function ensureAudioContext() {
+  if (!audioContext || audioContext.state === 'closed') {
+    audioContext = new AudioContext();
+    audioContext.addEventListener('statechange', renderScreenDiagnostics);
+  }
+  return audioContext;
+}
 function clearVoice(id) { const monitor = voiceMonitors.get(id); if (monitor) { clearInterval(monitor.timer); monitor.source.disconnect(); monitor.analyser.disconnect(); voiceMonitors.delete(id); } }
 function monitorVoice(id, stream, tile) {
   clearVoice(id);
   if (id.startsWith('screen-') || !stream.getAudioTracks().length) return;
   try {
-    audioContext ||= new AudioContext(); audioContext.resume();
+    ensureAudioContext().resume();
     const source = audioContext.createMediaStreamSource(stream), analyser = audioContext.createAnalyser(); analyser.fftSize = 512; source.connect(analyser);
     const samples = new Uint8Array(analyser.fftSize);
     const timer = setInterval(() => { if (!tile.isConnected) { clearVoice(id); return; } analyser.getByteTimeDomainData(samples); let total = 0; for (const sample of samples) total += ((sample - 128) / 128) ** 2; tile.classList.toggle('speaking', Math.sqrt(total / samples.length) > 0.045); }, 200);
@@ -139,6 +147,34 @@ function screenProgress(stats, baseline) {
   const reservedFrame = stats.width > 0 && stats.width <= 32 && stats.height > 0 && stats.height <= 32;
   return {connection:stats.connection,ice:stats.ice,frames:reservedFrame ? 0 : Math.max(0,stats.frames - (sameCounters ? baseline.frames : 0)),bytes:reservedFrame ? 0 : Math.max(0,stats.bytes - (sameCounters ? baseline.bytes : 0)),codec:stats.codec,limitation:stats.limitation,transport:'shared-media'};
 }
+function captureAudioInfo() {
+  const tracks = displayStream?.getAudioTracks() || [], track = tracks.find(track => track.readyState === 'live') || tracks[0];
+  const settings = track?.getSettings() || {};
+  return {requested:captureRequest?.audioRequested === true,trackCount:tracks.length,status:!displayStream ? 'inactive' : !captureRequest?.audioRequested ? 'not-requested' : !track ? 'not-returned' : track.readyState === 'ended' ? 'ended' : !track.enabled ? 'disabled' : track.muted ? 'muted' : 'available',enabled:track?.enabled ?? null,muted:track?.muted ?? null,readyState:track?.readyState || null,channelCount:settings.channelCount ?? null,sampleRate:settings.sampleRate ?? null};
+}
+function receivedSignalLevel(id) {
+  const analyser = audioNodes.get(id)?.analyser;
+  if (!analyser || audioContext?.state !== 'running') return null;
+  const samples = new Float32Array(analyser.fftSize); analyser.getFloatTimeDomainData(samples);
+  let total = 0; for (const sample of samples) total += sample * sample;
+  return Math.sqrt(total / samples.length);
+}
+function audioStatsSummary(stats, receivedId) {
+  const summary = {connection:stats.connection,bytes:stats.bytes,packets:stats.packets,codec:stats.codec,audioLevel:stats.audioLevel ?? null,totalAudioEnergy:stats.totalAudioEnergy ?? null};
+  if (receivedId) { const gain = audioNodes.get(receivedId)?.gain; summary.receivedSignalLevel = receivedSignalLevel(receivedId); summary.volumePercent = gain ? Math.round(gain.gain.value * 100) : null; }
+  return summary;
+}
+function captureAudioNotice() {
+  if (!displayStream) return;
+  const info = captureAudioInfo();
+  if (info.status === 'not-requested') { notice('Modo compatível: imagem sem áudio da tela. Seu microfone continua separado.'); return; }
+  if (info.status === 'not-returned') {
+    const canTryTab = captureRequest?.preferredSurface !== 'browser';
+    notice('O navegador forneceu a imagem, mas não forneceu uma faixa de áudio. No Chrome/Windows, selecione Tela inteira e ative Compartilhar áudio do sistema antes de confirmar. Para som de uma aba, você pode tentar uma guia com áudio.', canTryTab ? {label:'Trocar para guia com áudio',run:() => { stopScreen(); startScreen(false, 'browser'); }} : undefined);
+  } else if (info.status === 'ended' || info.status === 'disabled') notice('A faixa de áudio da transmissão foi interrompida. A imagem e o microfone são independentes; para voltar a compartilhar o som, pare a transmissão e selecione novamente a opção de áudio no navegador.');
+  else if (info.status === 'muted') notice('O navegador forneceu uma faixa de áudio, mas ela está temporariamente sem dados. Confira se há som tocando na origem compartilhada.');
+  else notice('O navegador forneceu uma faixa de áudio para a transmissão.');
+}
 function remoteScreenState(id, link, state, stream) {
   if (mediaLinks.get(id) !== link) return;
   if (state.phase === 'off') {
@@ -152,7 +188,7 @@ function remoteScreenState(id, link, state, stream) {
     screenReceiveHealth.set(id, health); monitorScreenReceive(id, health);
   }
   if (health.phase !== 'live' && state.phase === 'live') health.startedAt = Date.now();
-  health.phase = state.phase;
+  health.phase = state.phase; health.hasAudio = state.hasAudio === true;
   if (stream.getVideoTracks().length) { showScreenAudio(id, stream); if (!health.received) screenReceiveStatus(id, health, health.status); }
   renderScreenDiagnostics();
 }
@@ -164,7 +200,7 @@ function localScreenState(id, link, state) {
     health = {link,session:state.session,transfer:state.transfer,baseline:state.baseline,compatible:state.compatible,attempt:state.attempt || 0,startedAt:Date.now(),status:'Ativando a tela na conexão da chamada'};
     screenSendHealth.set(id, health); monitorScreenSend(id, health);
   }
-  health.phase = state.phase; health.limitsApplied = state.limitsApplied === true;
+  health.phase = state.phase; health.hasAudio = displayStream.getAudioTracks().some(track => track.readyState === 'live' && track.enabled); health.limitsApplied = state.limitsApplied === true;
   if (state.phase === 'error') health.status = 'A chamada não confirmou a ativação da tela';
   renderScreenDiagnostics();
 }
@@ -172,14 +208,20 @@ function renderScreenDiagnostics() {
   const panel = $('screen-diagnostics'); if (!panel) return;
   panel.hidden = !displayStream && !screenReceiveHealth.size;
   const list = $('screen-diagnostics-list'); list.replaceChildren();
+  if (displayStream) {
+    const info = captureAudioInfo(), row = document.createElement('p');
+    const labels = {'not-requested':'não solicitado (modo compatível)','not-returned':'o navegador não forneceu uma faixa de áudio',available:'faixa de áudio capturada',muted:'faixa capturada, temporariamente sem dados',ended:'faixa de áudio encerrada',disabled:'faixa de áudio desativada'};
+    row.textContent = 'Áudio na origem: ' + (labels[info.status] || info.status); list.append(row);
+  }
   for (const [direction, map] of [['Envio para',screenSendHealth], ['Recepção de',screenReceiveHealth]]) {
     for (const [id, health] of map) {
       const row = document.createElement('p');
-      row.textContent = direction + ' ' + (members.get(id) || 'Participante') + ': ' + health.status + (health.compatible ? ' · modo compatível' : '');
+      row.textContent = direction + ' ' + (members.get(id) || 'Participante') + ': ' + health.status + (health.compatible ? ' · modo compatível' : '') + (health.hasAudio ? ' · faixa de áudio presente' : ' · sem áudio da tela');
       list.append(row);
     }
   }
   if (!list.children.length) { const row = document.createElement('p'); row.textContent = 'Aguardando outro participante para confirmar o recebimento.'; list.append(row); }
+  const resume = $('audio-playback-resume'); if (resume) resume.hidden = audioContext?.state !== 'suspended';
 }
 function screenReceiveStatus(id, health, message) {
   health.status = message;
@@ -204,9 +246,10 @@ function monitorScreenSend(id, health) {
     if (screenSendHealth.get(id) !== health || health.checking) return;
     health.checking = true;
     try {
-      const stats = screenProgress(await health.link.stats('screenVideo', 'outbound'), health.baseline);
+      const [videoStats,audioStats] = await Promise.all([health.link.stats('screenVideo', 'outbound'),health.hasAudio ? health.link.stats('screenAudio', 'outbound') : null]);
+      const stats = screenProgress(videoStats, health.baseline);
       if (screenSendHealth.get(id) !== health) return;
-      health.stats = stats;
+      health.stats = stats; health.audioStats = audioStats ? audioStatsSummary(audioStats) : null;
       if (!health.confirmed && health.phase !== 'error') health.status = stats.connection === 'failed' ? 'A conexão da chamada falhou' : health.phase === 'prepare' ? 'Ativando a tela na conexão da chamada' : Date.now() - health.startedAt > SCREEN_CONNECT_TIMEOUT ? (stats.frames ? 'Enviando vídeo, mas sem confirmação de reprodução' : 'Nenhum quadro de vídeo enviado') : 'Aguardando confirmação de vídeo';
       renderScreenDiagnostics();
     } catch (err) { console.warn('Diagnóstico de envio indisponível:', err.name); }
@@ -218,9 +261,10 @@ function monitorScreenReceive(id, health) {
     if (screenReceiveHealth.get(id) !== health || health.checking) return;
     health.checking = true;
     try {
-      const stats = screenProgress(await health.link.stats('screenVideo', 'inbound'), health.baseline);
+      const [videoStats,audioStats] = await Promise.all([health.link.stats('screenVideo', 'inbound'),health.hasAudio ? health.link.stats('screenAudio', 'inbound') : null]);
+      const stats = screenProgress(videoStats, health.baseline);
       if (screenReceiveHealth.get(id) !== health) return;
-      health.stats = stats;
+      health.stats = stats; health.audioStats = audioStats ? audioStatsSummary(audioStats, 'screen-' + id) : null;
       const video = document.getElementById('video-screen-' + id)?.querySelector('video');
       if (!health.received && health.phase === 'live' && stats.frames > 0 && video?.readyState >= 2 && video.videoWidth > 32 && video.videoHeight > 32 && !video.paused) {
         health.received = true;
@@ -289,10 +333,10 @@ function videoTile(id, name, stream, local = false) {
     clearAudio(id);
     video.muted = true;
     try {
-      audioContext ||= new AudioContext();
-      const source = audioContext.createMediaStreamSource(stream), gain = audioContext.createGain();
-      gain.gain.value = Number(tile.querySelector('input').value) / 100; source.connect(gain).connect(audioContext.destination);
-      audioNodes.set(id, {source, gain}); audioContext.resume();
+      ensureAudioContext();
+      const source = audioContext.createMediaStreamSource(stream), gain = audioContext.createGain(), analyser = audioContext.createAnalyser(); analyser.fftSize = 512;
+      gain.gain.value = Number(tile.querySelector('input').value) / 100; source.connect(gain).connect(audioContext.destination); source.connect(analyser);
+      audioNodes.set(id, {source, gain, analyser}); audioContext.resume();
     } catch { tile.querySelector('video').muted = false; notice('Controle de volume ampliado indisponível neste navegador.'); }
   }
 }
@@ -480,12 +524,13 @@ function stopScreen() {
   screenAttempt++; screenStarting = false;
   screenSession = null;
   const old = displayStream; displayStream = null;
+  captureRequest = null;
   for (const id of screenSendHealth.keys()) clearScreenHealth(screenSendHealth, id);
   for (const link of mediaLinks.values()) link.setScreen(null, null).catch(err => link.callbacks.onError(err));
   old?.getTracks().forEach(track => { track.onended = null; track.stop(); });
   document.getElementById('video-screen-local')?.remove(); resetScreenButton(); notice(''); renderScreenDiagnostics();
 }
-async function startScreen(compatible = false) {
+async function startScreen(compatible = false, preferredSurface = 'monitor') {
   if (screenStarting || displayStream || !peer || $('meeting').hidden) return;
   if (!window.isSecureContext || !navigator.mediaDevices?.getDisplayMedia) {
     notice('Este navegador não oferece compartilhamento de tela. No computador, abra o link em uma versão atual do Edge, Chrome ou Firefox. No celular, você ainda pode assistir às transmissões.'); return;
@@ -498,20 +543,27 @@ async function startScreen(compatible = false) {
     // Experimental windowAudio options are intentionally omitted for compatibility.
     stream = await navigator.mediaDevices.getDisplayMedia(compatible
       ? {video:true, audio:false}
-      : {video:{width:{ideal:1920}, height:{ideal:1080}, frameRate:{ideal:60}}, audio:true, systemAudio:'include'});
+      : {video:{width:{ideal:1920}, height:{ideal:1080}, frameRate:{ideal:60},displaySurface:preferredSurface},audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,suppressLocalAudioPlayback:false},systemAudio:'include'});
     if (peer !== activePeer || attempt !== screenAttempt || $('meeting').hidden) { stream.getTracks().forEach(track => track.stop()); return; }
     const track = stream.getVideoTracks()[0];
     if (!track || track.readyState === 'ended') throw new DOMException('Captura sem vídeo', 'NotReadableError');
     displayStream = stream; screenSession = crypto.randomUUID();
+    captureRequest = {audioRequested:!compatible,preferredSurface:compatible ? null : preferredSurface};
     track.onended = () => { if (displayStream === stream) stopScreen(); };
+    const audioChanged = () => {
+      if (displayStream !== stream) return;
+      captureAudioNotice();
+      for (const link of mediaLinks.values()) link.refreshAudio().catch(err => link.callbacks.onError(err));
+      for (const health of screenSendHealth.values()) health.hasAudio = stream.getAudioTracks().some(track => track.readyState === 'live' && track.enabled);
+      renderScreenDiagnostics();
+    };
+    for (const audio of stream.getAudioTracks()) for (const event of ['mute','unmute','ended']) audio.addEventListener(event, audioChanged);
     videoTile('screen-local', 'Sua transmissão', stream, true);
-    notice(stream.getAudioTracks().length
-      ? 'Compartilhamento com áudio ativado.'
-      : 'Tela compartilhada sem áudio. Para transmitir som no Edge/Chrome, escolha Tela inteira e ative Compartilhar áudio do sistema, quando disponível.');
+    captureAudioNotice();
   } catch (err) {
     stream?.getTracks().forEach(track => track.stop());
     if (peer !== activePeer || attempt !== screenAttempt) return;
-    displayStream = null; screenSession = null; document.getElementById('video-screen-local')?.remove();
+    displayStream = null; screenSession = null; captureRequest = null; document.getElementById('video-screen-local')?.remove();
     console.warn('Falha na captura da tela:', err.name, err.message);
     const canRetry = !compatible && ['NotReadableError','OverconstrainedError','AbortError','TypeError'].includes(err.name);
     notice(screenErrorMessage(err), canRetry ? {label:'Tentar modo compatível (sem áudio)', run:() => startScreen(true)} : undefined);
@@ -561,13 +613,14 @@ $('screen').onclick = async () => {
 };
 $('copy').onclick = async () => { try { const url = new URL('sala.html', location.href); url.searchParams.set('sala', roomCode); await navigator.clipboard.writeText(url.href); $('copy').textContent = 'Copiado!'; setTimeout(() => $('copy').textContent = 'Copiar convite', 2000); } catch { notice('Não foi possível copiar. Compartilhe o código: ' + roomCode); } };
 const diagnostics = document.createElement('details'); diagnostics.id = 'screen-diagnostics'; diagnostics.hidden = true;
-diagnostics.innerHTML = '<summary>Status da transmissão</summary><small>Câmera, voz e tela usam a mesma conexão de mídia.</small><div id="screen-diagnostics-list"></div><button type="button" id="screen-diagnostics-copy">Copiar diagnóstico</button><small>Não inclui imagens, mensagens, endereços IP ou senhas.</small>';
+diagnostics.innerHTML = '<summary>Status da transmissão</summary><small>Câmera, voz e tela usam a mesma conexão de mídia.</small><div id="screen-diagnostics-list"></div><button type="button" id="screen-diagnostics-copy">Copiar diagnóstico</button> <button type="button" id="audio-playback-resume" hidden>Ativar som recebido</button><small>Não inclui imagens, mensagens, endereços IP ou senhas.</small>';
 $('notice').after(diagnostics);
 function screenDiagnosticReport() {
   const settings = displayStream?.getVideoTracks()[0]?.getSettings();
-  const entries = map => Array.from(map, ([id, health]) => ({participant:members.get(id) || 'Participante',status:health.status,confirmed:health.confirmed === true || health.received === true,compatible:health.compatible,limitsApplied:health.limitsApplied === true,retries:health.retries ?? health.attempt,stats:health.stats || null}));
-  return {version:'shared-media-1',transport:'shared-media',browser:navigator.userAgent,capture:settings ? {width:settings.width,height:settings.height,frameRate:settings.frameRate} : null,sending:entries(screenSendHealth),receiving:entries(screenReceiveHealth)};
+  const entries = map => Array.from(map, ([id, health]) => ({participant:members.get(id) || 'Participante',status:health.status,confirmed:health.confirmed === true || health.received === true,compatible:health.compatible,limitsApplied:health.limitsApplied === true,retries:health.retries ?? health.attempt,hasAudio:health.hasAudio === true,audioStats:health.audioStats || null,stats:health.stats || null}));
+  return {version:'shared-media-audio-1',transport:'shared-media',browser:navigator.userAgent,capture:settings ? {width:settings.width,height:settings.height,frameRate:settings.frameRate,displaySurface:settings.displaySurface || null,preferredSurface:captureRequest?.preferredSurface,audio:captureAudioInfo()} : null,playback:{audioContext:audioContext?.state || 'not-created'},sending:entries(screenSendHealth),receiving:entries(screenReceiveHealth)};
 }
+$('audio-playback-resume').onclick = async () => { try { await audioContext?.resume(); renderScreenDiagnostics(); } catch { notice('O navegador não liberou a reprodução. Confira o volume do site e tente interagir com o controle de volume da transmissão.'); } };
 $('screen-diagnostics-copy').onclick = async () => {
   try { await navigator.clipboard.writeText(JSON.stringify(screenDiagnosticReport(), null, 2)); $('screen-diagnostics-copy').textContent = 'Diagnóstico copiado'; }
   catch { notice('Não foi possível copiar. Envie uma foto do painel Status da transmissão.'); }
